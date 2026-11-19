@@ -15,6 +15,7 @@ message IdPk {
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
+  bool lan_probe = 3;
 }
 
 enum ConnType {
@@ -44,6 +45,7 @@ message PunchHoleRequest {
   // the webrtc:// payload): under force_relay it tells the peer whether the relay is
   // transport-forced (WebSocket — answer may use full ICE) or policy (Relay-only + TURN).
   string webrtc_sdp_offer = 12;
+  bool lan_probe = 30;
 }
 
 message ControlPermissions {
@@ -154,6 +156,7 @@ message PunchHoleResponse {
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
   string webrtc_sdp_answer = 12;
+  bool lan_probe = 30;
 }
 
 message ConfigUpdate {
@@ -203,6 +206,7 @@ message FetchLocalAddr {
   bytes socket_addr_v6 = 3;
   ControlPermissions control_permissions = 4;
   ControlledContext controlled_context = 5;
+  bool lan_probe = 30;
 }
 
 message LocalAddr {
@@ -212,6 +216,7 @@ message LocalAddr {
   string id = 4;
   string version = 5;
   bytes socket_addr_v6 = 6;
+  bool lan_probe = 30;
 }
 
 message PeerDiscovery {

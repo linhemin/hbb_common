@@ -13,8 +13,6 @@
 //! - `on_*` handlers live in the pc: one holding a strong `Arc<RTCPeerConnection>` leaks it.
 //! - `close()` latches `is_closed` before its first await, so a cancelled close is unretryable.
 //! - `Disconnected` is transient; only `Failed`/`Closed` are terminal.
-//! - `RTCIceCandidatePair`'s `Display` layout — `is_relayed()` parses it because 0.13 keeps the
-//!   candidates private. 0.17+ exposes them; switch and delete the parse.
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -633,6 +631,13 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        if !force_relay {
+            s.set_ice_gather_interface_srflx(true);
+            // A checked NAT mapping can be faster than a host candidate on a VPN.
+            // Give both a chance in the same ICE nomination window.
+            s.set_srflx_acceptance_min_wait(Some(Duration::ZERO));
+            s.set_prflx_acceptance_min_wait(Some(Duration::ZERO));
+        }
         // Both sides must still be checking when a late candidate reaches a cellular
         // controller. Give iOS offerers the same per-pair budget as the answerer.
         if !remote_endpoint.is_empty() || cfg!(target_os = "ios") {
@@ -1087,16 +1092,22 @@ impl WebRTCStream {
         let dtls = self.pc.sctp().transport();
         let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
 
-        // Not the stats report's `nominated` flag: webrtc-ice never clears it per checklist entry,
-        // so after a pair switch several entries carry it and map order decides the answer.
-        // 0.13 keeps the candidates private, so read the types out of `Display` by position.
-        let relay = RTCIceCandidateType::Relay.to_string();
-        Some(
-            pair.to_string()
-                .split(" <-> ")
-                .filter_map(|side| side.split_whitespace().nth(2))
-                .any(|typ| typ == relay),
-        )
+        let local = pair.local();
+        let remote = pair.remote();
+        log::debug!(
+            "Selected ICE pair: {} {} -> {} {}",
+            local.protocol, local.typ, remote.protocol, remote.typ
+        );
+        Self::pair_is_relayed(local.typ, remote.typ)
+    }
+
+    fn pair_is_relayed(local: RTCIceCandidateType, remote: RTCIceCandidateType) -> Option<bool> {
+        use RTCIceCandidateType::*;
+        match (local, remote) {
+            (Relay, _) | (_, Relay) => Some(true),
+            (Unspecified, _) | (_, Unspecified) => None,
+            _ => Some(false),
+        }
     }
 
     /// Whether the nominated pair reaches the peer over IPv6 — `None` before one is selected.
@@ -1105,12 +1116,7 @@ impl WebRTCStream {
     pub async fn is_remote_ipv6(&self) -> Option<bool> {
         let dtls = self.pc.sctp().transport();
         let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
-        // Same `Display` parse as `is_relayed`, one token over: a side renders as
-        // `(remote) <protocol> <typ> <address>:<port>`, and `protocol` is only udp/tcp, so the
-        // family has to come from the address — an IPv6 literal is the only one with two colons.
-        let pair = pair.to_string();
-        let remote = pair.split(" <-> ").nth(1)?;
-        Some(remote.split_whitespace().nth(3)?.matches(':').count() > 1)
+        Some(pair.remote().address.parse::<IpAddr>().ok()?.is_ipv6())
     }
 
     #[inline]
@@ -1561,6 +1567,16 @@ mod tests {
 
     async fn new_test_stream() -> WebRTCStream {
         WebRTCStream::new("", false, 10000).await.unwrap()
+    }
+
+    #[test]
+    fn test_selected_pair_classification() {
+        use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::*;
+        assert_eq!(WebRTCStream::pair_is_relayed(Host, Srflx), Some(false));
+        assert_eq!(WebRTCStream::pair_is_relayed(Prflx, Host), Some(false));
+        assert_eq!(WebRTCStream::pair_is_relayed(Relay, Host), Some(true));
+        assert_eq!(WebRTCStream::pair_is_relayed(Host, Relay), Some(true));
+        assert_eq!(WebRTCStream::pair_is_relayed(Unspecified, Host), None);
     }
 
     #[test]

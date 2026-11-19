@@ -25,6 +25,7 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc::data_channel::RTCDataChannel;
+pub use webrtc::ice::agent::agent_config::InterfaceStunProvider;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
@@ -35,6 +36,7 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+pub use webrtc::util::Conn as InterfaceStunConn;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -155,6 +157,10 @@ const FRAG_END: u8 = 0;
 /// unauthenticated peer can make a receiver hold. Kept at parity with TCP on purpose: one session
 /// moves between both paths, so a transport-specific ceiling would kill it on the other one.
 const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
+type InterfaceStunFactory = fn() -> Option<Arc<dyn InterfaceStunProvider>>;
+static INTERFACE_STUN_FACTORY: std::sync::OnceLock<InterfaceStunFactory> =
+    std::sync::OnceLock::new();
+
 // Four networks, not four names: webrtc-ice queries each URL from its own socket, so entries
 // sharing a host buy no redundancy - the two this list used to carry failed together, in the same
 // millisecond, on a peer whose route to that one host was down. Two anycast, two unicast; the 443
@@ -517,6 +523,21 @@ impl WebRTCStream {
             .collect()
     }
 
+    /// Read the current adapter choice when a new peer connection is created.
+    pub fn set_interface_stun_provider_factory(
+        factory: fn() -> Option<Arc<dyn InterfaceStunProvider>>,
+    ) {
+        let _ = INTERFACE_STUN_FACTORY.set(factory);
+    }
+
+    /// Supplemental physical-adapter UDP requests use only the known default host/port pairs.
+    pub fn is_default_stun_endpoint(host: &str, port: u16) -> bool {
+        let endpoint = format!("stun:{}:{}", host.trim_end_matches('.'), port);
+        DEFAULT_ICE_SERVERS
+            .iter()
+            .any(|url| url.eq_ignore_ascii_case(&endpoint))
+    }
+
     /// Split out from `get_ice_servers` so parsing can be exercised without touching the
     /// process-global, on-disk-persisted option — the tests run in parallel threads of one
     /// process, so a test that rewrote it raced every peer connection another test was building.
@@ -633,6 +654,9 @@ impl WebRTCStream {
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
         if !force_relay {
             s.set_ice_gather_interface_srflx(true);
+            if let Some(provider) = INTERFACE_STUN_FACTORY.get().and_then(|factory| factory()) {
+                s.set_ice_interface_stun_provider(provider);
+            }
             // A checked NAT mapping can be faster than a host candidate on a VPN.
             // Give both a chance in the same ICE nomination window.
             s.set_srflx_acceptance_min_wait(Some(Duration::ZERO));

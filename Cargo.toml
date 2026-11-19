@@ -86,6 +86,9 @@ protobuf-codegen = { version = "3.7" }
 clap = "4.5.51"
 webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin, see above)
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 users = { version = "0.11" }

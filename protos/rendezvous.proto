@@ -253,6 +253,8 @@ message KeyExchange {
 message KxParams {
   bytes pk = 1;
   uint32 version = 2;
+  // Authenticated opt-in to retrying direct paths during an established relay session.
+  bool allow_session_direct = 3;
 }
 
 message HealthCheck {

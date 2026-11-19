@@ -52,10 +52,6 @@ use crate::rx_probe::RxProbe;
 use crate::sodiumoxide::crypto::secretbox::Key;
 use crate::ResultType;
 
-#[cfg(windows)]
-#[path = "webrtc_windows.rs"]
-mod windows_routes;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WebRTCConnectionState {
     Pending,
@@ -645,14 +641,9 @@ impl WebRTCStream {
         // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
         // gathering one never yields a candidate - only a failed bind and a warning per address.
         // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
-        #[cfg(windows)]
-        let excluded = windows_routes::ExcludedAdapters::read()?;
-        s.set_ip_filter(Box::new(move |ip: IpAddr| {
-            #[cfg(windows)]
-            if excluded.contains(ip) {
-                return false;
-            }
-            !matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
+        s.set_ip_filter(Box::new(|ip: IpAddr| match ip {
+            IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+            IpAddr::V4(_) => true,
         }));
 
         // KCP's nc=1 profile by default, with the same opt-in to a congestion window as
@@ -1151,8 +1142,6 @@ impl WebRTCStream {
         } else {
             self.wait_for_connect_result().await?;
         }
-        #[cfg(windows)]
-        windows_routes::check_selected(&self.pc).await?;
         Ok(())
     }
 

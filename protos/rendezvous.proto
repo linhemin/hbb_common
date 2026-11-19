@@ -4,6 +4,7 @@ package hbb;
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
+  bool lan_probe = 3;
 }
 
 enum ConnType {
@@ -23,6 +24,7 @@ message PunchHoleRequest {
   ConnType conn_type = 4;
   string token = 5;
   string version = 6;
+  bool lan_probe = 30;
 }
 
 message PunchHole { 
@@ -93,6 +95,7 @@ message PunchHoleResponse {
   }
   string other_failure = 7;
   int32 feedback = 8;
+  bool lan_probe = 30;
 }
 
 message ConfigUpdate {
@@ -133,6 +136,7 @@ message SoftwareUpdate { string url = 1; }
 message FetchLocalAddr { 
   bytes socket_addr = 1; 
   string relay_server = 2;
+  bool lan_probe = 30;
 }
 
 message LocalAddr {
@@ -141,6 +145,7 @@ message LocalAddr {
   string relay_server = 3;
   string id = 4;
   string version = 5;
+  bool lan_probe = 30;
 }
 
 message PeerDiscovery {

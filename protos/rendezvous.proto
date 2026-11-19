@@ -183,6 +183,9 @@ message KeyExchange {
 message KxParams {
   bytes pk = 1;
   uint32 version = 2;
+  // The server allows endpoints to negotiate a direct path within this relay session.
+  // Only meaningful inside verified signed_params. Older servers leave it false.
+  bool allow_session_direct = 3;
 }
 
 message IceCandidate {

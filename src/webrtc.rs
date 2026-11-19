@@ -554,7 +554,7 @@ impl WebRTCStream {
         ice_servers
     }
 
-    /// How many binding requests the answerer's ICE agent sends on a pair without a response
+    /// How many binding requests a persistent ICE agent sends on a pair without a response
     /// before giving up on it: 74 at the 200ms check interval is ~14.8s, just inside the 15s
     /// persistence libwebrtc gives a pair (`CONNECTION_WRITE_TIMEOUT`), so both ends of a
     /// browser session keep checking for about the same time. The ICE crate's default of 7
@@ -633,10 +633,9 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
-        // Answerer only: `remote_endpoint` is empty when this side is the offerer. The
-        // desktop controller keeps the crate default so it stays an unchanged comparison
-        // point while the persistence experiment runs on the controlled side.
-        if !remote_endpoint.is_empty() {
+        // Both sides must still be checking when a late candidate reaches a cellular
+        // controller. Give iOS offerers the same per-pair budget as the answerer.
+        if !remote_endpoint.is_empty() || cfg!(target_os = "ios") {
             s.set_ice_max_binding_requests(Some(Self::ICE_MAX_BINDING_REQUESTS));
         }
         // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
@@ -941,9 +940,8 @@ impl WebRTCStream {
 
     /// One-shot endpoint: waits for ICE gathering so the SDP already carries the candidates.
     /// The wait is deliberately unbounded — a deadline here would return a half-gathered SDP and
-    /// defeat the contract; callers needing one should wrap the call or use the trickle variant,
-    /// which both rustdesk signaling paths do. Remaining callers are the loopback tests and
-    /// `examples/webrtc.rs`, neither of which bounds it.
+    /// defeat the contract. Use `get_local_endpoint_within` for a best-effort snapshot or
+    /// `local_endpoint` when the signaling channel supports trickling candidates.
     #[inline]
     pub async fn get_local_endpoint(&self) -> ResultType<String> {
         // Preserve the original one-shot endpoint contract: callers that only exchange this SDP
@@ -951,6 +949,19 @@ impl WebRTCStream {
         // gathered host/srflx/relay candidates.
         let mut gather_complete = self.pc.gathering_complete_promise().await;
         let _gathering_channel_closed = gather_complete.recv().await;
+        self.gathered_endpoint().await
+    }
+
+    /// For a peer that expects a single SDP over a reliable channel. Include candidates already
+    /// gathered if a STUN server is slow or unreachable. A later candidate cannot be signaled
+    /// to a peer that does not support trickle on this channel.
+    pub async fn get_local_endpoint_within(&self, budget: Duration) -> ResultType<String> {
+        let mut complete = self.pc.gathering_complete_promise().await;
+        let _ = timeout(budget, complete.recv()).await;
+        self.gathered_endpoint().await
+    }
+
+    async fn gathered_endpoint(&self) -> ResultType<String> {
         let Some(local_desc) = self.pc.local_description().await else {
             return Err(anyhow::anyhow!("Local desc is not set"));
         };
@@ -1747,6 +1758,24 @@ mod tests {
             endpoint.len(),
             WebRTCStream::UDP_ENDPOINT_BUDGET
         );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_endpoint_includes_candidates_ready_at_deadline() {
+        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let live = first_gathered_description(&offerer).await;
+        let snapshot = offerer.get_local_endpoint_within(Duration::ZERO).await;
+        offerer.close().await;
+        let live = live.expect("no ICE candidate gathered within 10s");
+        let json = WebRTCStream::get_remote_offer(&snapshot.unwrap()).unwrap();
+        let snapshot: RTCSessionDescription = serde_json::from_str(&json).unwrap();
+        for line in live
+            .sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+        {
+            assert!(snapshot.sdp.lines().any(|candidate| candidate == line));
+        }
     }
 
     /// The split itself: candidates out, everything ICE and DTLS need to start in. A stripped

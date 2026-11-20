@@ -40,6 +40,7 @@ pub use webrtc::util::Conn as InterfaceStunConn;
 pub use webrtc::util::Result as InterfaceStunResult;
 
 mod path_diagnostics;
+mod mapping_observers;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -513,9 +514,14 @@ impl WebRTCStream {
 
     #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
-        Self::parse_ice_servers(&config::Config::get_option(
+        let mut servers = Self::parse_ice_servers(&config::Config::get_option(
             config::keys::OPTION_ICE_SERVERS,
-        ))
+        ));
+        let urls: Vec<_> = mapping_observers::current().into_iter().map(|ep| format!("stun:{ep}")).collect();
+        if !urls.is_empty() {
+            servers.insert(0, RTCIceServer { urls, ..Default::default() });
+        }
+        servers
     }
 
     /// The default UDP STUN servers as bare `host:port`, for application-level address probes.
@@ -531,6 +537,14 @@ impl WebRTCStream {
         factory: fn() -> Option<Arc<dyn InterfaceStunProvider>>,
     ) {
         let _ = INTERFACE_STUN_FACTORY.set(factory);
+    }
+
+    pub fn remember_signed_observers(key: &str, observers: &[String]) {
+        mapping_observers::remember(key, observers);
+    }
+
+    pub fn signed_observer(endpoint: std::net::SocketAddrV4) -> bool {
+        mapping_observers::current().contains(&endpoint)
     }
 
     /// Supplemental physical-adapter UDP requests use only the known default host/port pairs.

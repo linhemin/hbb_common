@@ -265,6 +265,9 @@ fn append_mapping_diagnostics(out: &mut String, stats: &MappingProbeStats) {
         "udpMapping [sockets,stable,portChanged,addressChanged,insufficient,alternateTested,alternateChanged]={:?}",
         [stats.sockets, stable, port, address, insufficient, alternate_tested, alternate_changed]
     );
+    if stats.ordered_profiles.iter().any(|n| *n != 0) {
+        let _ = writeln!(out, "orderedMappings [stable,constantStep,irregular,insufficient]={:?}", stats.ordered_profiles);
+    }
 }
 
 fn selected(c: &RTCIceCandidate) -> String {
@@ -274,6 +277,8 @@ fn selected(c: &RTCIceCandidate) -> String {
 }
 
 impl WebRTCStream {
+    pub(super) fn is_public_v4(ip: Ipv4Addr) -> bool { Scope::v4(ip) == Scope::Public4 }
+
     pub async fn grouped_public_candidates(&self) -> Vec<(String, SocketAddrV4, u8)> {
         if self.relay_only { return Vec::new(); }
         self.pc.sctp().transport().ice_transport().grouped_public_candidates().await
@@ -315,6 +320,11 @@ impl WebRTCStream {
         let mut fields = candidate.candidate.split_ascii_whitespace();
         if fields.nth(1)? != "1" || fields.nth(4)? != "typ" || fields.next()? != "srflx" { return None; }
         Self::public_udp_candidate_endpoint(json)
+    }
+
+    pub async fn ordered_mapping_profiles(&self) -> Option<[u8; 4]> {
+        let stats = self.pc.sctp().transport().ice_transport().udp_mapping_stats().await?;
+        Some(stats.ordered_profiles.map(|n| n.min(255) as u8))
     }
 
     /// Address advertised by a locally generated, globally routed IPv4 UDP candidate.
@@ -497,6 +507,7 @@ mod tests {
             inconclusive: 3,
             alternate_tested: 12,
             alternate_changed: 4,
+            ..Default::default()
         };
         let mut text = String::new();
         append_mapping_diagnostics(&mut text, &measurement);

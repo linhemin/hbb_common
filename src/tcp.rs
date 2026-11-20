@@ -60,7 +60,7 @@ pub struct KxTranscript<'a> {
 
 /// The sending key, the send and receive counters, and the receiving key where it differs.
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>);
+pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>, Option<(String, Vec<String>)>);
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -156,6 +156,17 @@ impl FramedStream {
     {
         let proxy = Proxy::from_conf(proxy_conf, Some(ms_timeout))?;
         proxy.connect::<T>(target, local_addr).await
+    }
+
+    // Observer hints may be activated only after a round trip with this session key.
+    pub fn stage_signed_observers(&mut self, key: &str, observers: Vec<String>) {
+        if let Some(cipher) = self.2.as_mut() {
+            cipher.4 = Some((key.to_owned(), observers.into_iter().take(4).collect()));
+        }
+    }
+
+    pub fn take_signed_observers(&mut self) -> Option<(String, Vec<String>)> {
+        self.2.as_mut()?.4.take()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -340,7 +351,7 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0, None)
+        Self(key, 0, 0, None, None)
     }
 
     /// Version 1: the initiator, the side that sent the sealed key, sends under one subkey and
@@ -349,9 +360,9 @@ impl Encrypt {
         let initiator = Self::derive_subkey(&key, KX_SPLIT_INITIATOR, t)?;
         let responder = Self::derive_subkey(&key, KX_SPLIT_RESPONDER, t)?;
         Ok(if is_initiator {
-            Self(initiator, 0, 0, Some(responder))
+            Self(initiator, 0, 0, Some(responder), None)
         } else {
-            Self(responder, 0, 0, Some(initiator))
+            Self(responder, 0, 0, Some(initiator), None)
         })
     }
 

@@ -255,6 +255,8 @@ message KxParams {
   uint32 version = 2;
   // Authenticated opt-in to retrying direct paths during an established relay session.
   bool allow_session_direct = 3;
+  // Public IPv4:port STUN observers supplied by the operator in this signed handshake.
+  repeated string udp_mapping_observers = 4;
 }
 
 message HealthCheck {

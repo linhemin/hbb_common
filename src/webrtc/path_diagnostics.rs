@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 use webrtc::{
+    ice::agent::mapping_probe::MappingProbeStats,
     ice::agent::socket_diagnostics::UdpSocketDiagnostics,
     ice::candidate::{CandidatePairState, CandidateType},
     ice_transport::ice_candidate::RTCIceCandidate,
@@ -238,6 +239,33 @@ fn append_socket_diagnostics(out: &mut String, rx: &UdpSocketDiagnostics) {
     );
 }
 
+// Count each actual candidate socket once. Neither the local endpoint nor any of
+// the addresses observed by STUN belong in the on-device or remote summary.
+fn mapping_counts(stats: &MappingProbeStats) -> [u32; 6] {
+    [
+        stats.stable,
+        stats.port_changed,
+        stats.address_changed,
+        stats.inconclusive,
+        stats.alternate_tested,
+        stats.alternate_changed,
+    ]
+}
+
+fn mapping_wire_counts(stats: &MappingProbeStats) -> [u8; 6] {
+    mapping_counts(stats).map(|n| n.min(u8::MAX as u32) as u8)
+}
+
+fn append_mapping_diagnostics(out: &mut String, stats: &MappingProbeStats) {
+    let [stable, port, address, insufficient, alternate_tested, alternate_changed] =
+        mapping_counts(stats);
+    let _ = writeln!(
+        out,
+        "udpMapping [sockets,stable,portChanged,addressChanged,insufficient,alternateTested,alternateChanged]={:?}",
+        [stats.sockets, stable, port, address, insufficient, alternate_tested, alternate_changed]
+    );
+}
+
 fn selected(c: &RTCIceCandidate) -> String {
     // Format only known enum types plus a scope we classified ourselves. The candidate's
     // own Display includes its raw IP, port and foundation.
@@ -245,6 +273,42 @@ fn selected(c: &RTCIceCandidate) -> String {
 }
 
 impl WebRTCStream {
+    /// Compare public IPv4 mappings from locally configured STUN destinations on
+    /// the sockets of this attempt's published server-reflexive candidates. Normal
+    /// ICE runs throughout. The first four counts classify each sampled socket
+    /// as stable across responding destinations, changed port, changed IP, or
+    /// insufficient observations. The last two count sockets with a usable
+    /// alternate-port observation and those whose mapping changed in that test.
+    /// These are subsets. All zeros mean no sockets were measured. Reachability
+    /// of the peer is determined by ICE checks.
+    pub async fn wait_for_punch_ready(&self) -> [u8; 6] {
+        if self.relay_only {
+            return [0; 6];
+        }
+        self.pc
+            .sctp()
+            .transport()
+            .ice_transport()
+            .measure_udp_mappings()
+            .await
+            .as_ref()
+            .map_or([0; 6], mapping_wire_counts)
+    }
+
+    /// Wake the existing ICE checklist at a time agreed via the encrypted session.
+    /// A successful wake does not indicate successful connectivity or nomination.
+    pub async fn request_punch_check(&self) -> bool {
+        if self.relay_only {
+            return false;
+        }
+        self.pc
+            .sctp()
+            .transport()
+            .ice_transport()
+            .request_connectivity_check()
+            .await
+    }
+
     /// A local, bounded snapshot of this stream's actual ICE checklist (never its SDP).
     /// Only fixed labels, enumerated states and counters may enter the returned text.
     pub async fn ice_path_diagnostics(&self) -> String {
@@ -258,10 +322,11 @@ impl WebRTCStream {
             sctp.state(),
             self.pc.connection_state()
         );
-        let (pair, stats, socket) = tokio::join!(
+        let (pair, stats, socket, mapping) = tokio::join!(
             tokio::time::timeout(BUDGET, ice.get_selected_candidate_pair()),
             tokio::time::timeout(BUDGET, self.pc.get_stats()),
-            tokio::time::timeout(BUDGET, ice.udp_socket_diagnostics())
+            tokio::time::timeout(BUDGET, ice.udp_socket_diagnostics()),
+            tokio::time::timeout(BUDGET, ice.udp_mapping_stats())
         );
         match pair {
             Ok(Some(pair)) => {
@@ -284,6 +349,13 @@ impl WebRTCStream {
             Ok(None) => out.push_str("udpCandidate=unavailable\n"),
             Err(_) => out.push_str("udpCandidate=unavailable (timeout)\n"),
         }
+        // This reads already collected evidence. Copying a report must never
+        // issue STUN traffic or start measurement on an uncoordinated session.
+        match mapping {
+            Ok(Some(stats)) => append_mapping_diagnostics(&mut out, &stats),
+            Ok(None) => out.push_str("udpMapping=unavailable\n"),
+            Err(_) => out.push_str("udpMapping=unavailable (timeout)\n"),
+        }
         out
     }
 }
@@ -296,6 +368,23 @@ mod tests {
         ice::agent::agent_stats::{CandidatePairStats, CandidateStats},
         stats::SourceStatsType,
     };
+
+    #[test]
+    fn mapping_report_preserves_socket_counts_and_bounds_the_wire_summary() {
+        let measurement = MappingProbeStats {
+            sockets: 273,
+            stable: 258,
+            port_changed: 7,
+            address_changed: 5,
+            inconclusive: 3,
+            alternate_tested: 12,
+            alternate_changed: 4,
+        };
+        let mut text = String::new();
+        append_mapping_diagnostics(&mut text, &measurement);
+        assert_eq!(text, "udpMapping [sockets,stable,portChanged,addressChanged,insufficient,alternateTested,alternateChanged]=[273, 258, 7, 5, 3, 12, 4]\n");
+        assert_eq!(mapping_wire_counts(&measurement), [255, 7, 5, 3, 12, 4]);
+    }
 
     #[test]
     fn candidate_scopes_preserve_unavailable_and_special_use() {

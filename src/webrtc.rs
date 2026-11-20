@@ -2123,6 +2123,45 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         (offerer, answerer)
     }
 
+    #[tokio::test]
+    async fn mapping_probe_does_not_take_over_an_established_udp_session() {
+        let (mut offerer, mut answerer) = connect_loopback().await;
+        let controller = offerer.clone();
+        let controlled = answerer.clone();
+        assert!(controller
+            .ice_path_diagnostics()
+            .await
+            .lines()
+            .any(|line| line == "udpMapping=unavailable"));
+        let (local, remote, ()) = timeout(Duration::from_secs(6), async {
+            tokio::join!(
+                controller.wait_for_punch_ready(),
+                controlled.wait_for_punch_ready(),
+                async {
+                    // The peers already have a selected pair. A coordinated wake
+                    // should be ignored, and the STUN measurement must leave the
+                    // DTLS/SCTP payload on the existing ICE socket untouched.
+                    let nudged = tokio::join!(
+                        controller.request_punch_check(),
+                        controlled.request_punch_check()
+                    );
+                    assert_eq!(nudged, (false, false));
+                    offerer.send_raw(b"checking".to_vec()).await.unwrap();
+                    assert_eq!(&answerer.next().await.unwrap().unwrap()[..], b"checking");
+                }
+            )
+        })
+        .await
+        .expect("mapping check blocked a connected WebRTC session");
+        for counts in [local, remote] {
+            assert!(counts[5] <= counts[4]);
+        }
+        offerer.close().await;
+        answerer.close().await;
+        assert_eq!(controller.wait_for_punch_ready().await, [0; 6]);
+        assert!(!controller.request_punch_check().await);
+    }
+
     // next()'s teardown must not be cancellable: an awaited close that loses the select! race
     // against a consumer's timer strands the pc (is_closed already latched) and its SESSIONS
     // entry. `close_detached` is non-async, so what needs proving is that the handoff completes.

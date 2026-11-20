@@ -1,8 +1,9 @@
 //! On-device summaries of one ICE agent. Never serialize the raw WebRTC stats report.
 use super::WebRTCStream;
 use std::{
+    collections::HashSet,
     fmt::Write,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     time::Duration,
 };
 use webrtc::{
@@ -273,6 +274,56 @@ fn selected(c: &RTCIceCandidate) -> String {
 }
 
 impl WebRTCStream {
+    /// Address advertised by a locally generated, globally routed IPv4 UDP candidate.
+    pub fn public_udp_candidate_endpoint(json: &[u8]) -> Option<SocketAddrV4> {
+        let candidate: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit =
+            serde_json::from_slice(json).ok()?;
+        let mut fields = candidate.candidate.split_ascii_whitespace();
+        fields.next()?.strip_prefix("candidate:")?;
+        if !fields.nth(1)?.eq_ignore_ascii_case("udp") {
+            return None;
+        }
+        let ip = fields.nth(1)?.parse::<Ipv4Addr>().ok()?;
+        let port = fields.next()?.parse::<u16>().ok()?;
+        (Scope::v4(ip) == Scope::Public4 && port != 0).then(|| SocketAddrV4::new(ip, port))
+    }
+
+    /// Only successful ICE request writes count. STUN discovery and a request written
+    /// by a different local candidate cannot release this candidate.
+    pub async fn checked_public_udp_endpoints(&self) -> HashSet<SocketAddrV4> {
+        let Ok(stats) = tokio::time::timeout(BUDGET, self.pc.get_stats()).await else {
+            return HashSet::new();
+        };
+        let mut checked = HashSet::new();
+        for item in stats.reports.values() {
+            let StatsReportType::CandidatePair(pair) = item else {
+                continue;
+            };
+            if pair.requests_sent == 0 {
+                continue;
+            }
+            let Some(StatsReportType::RemoteCandidate(remote)) = stats.reports.get(&pair.remote_candidate_id) else {
+                continue;
+            };
+            let Some(StatsReportType::LocalCandidate(local)) = stats.reports.get(&pair.local_candidate_id) else {
+                continue;
+            };
+            if local.network_type != webrtc::ice::network_type::NetworkType::Udp4
+                || remote.candidate_type == CandidateType::Relay
+                || local.candidate_type == CandidateType::Relay
+                || Scope::of(&remote.ip) != Scope::Public4
+            {
+                continue;
+            }
+            if let Ok(ip) = local.ip.parse::<Ipv4Addr>() {
+                if Scope::v4(ip) == Scope::Public4 {
+                    checked.insert(SocketAddrV4::new(ip, local.port));
+                }
+            }
+        }
+        checked
+    }
+
     /// Compare public IPv4 mappings from locally configured STUN destinations on
     /// the sockets of this attempt's published server-reflexive candidates. Normal
     /// ICE runs throughout. The first four counts classify each sampled socket

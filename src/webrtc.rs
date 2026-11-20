@@ -596,11 +596,17 @@ impl WebRTCStream {
         force_relay: bool,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        Self::new_with_grouped_checks(remote_endpoint, force_relay, ms_timeout, false).await
+    }
+
+    pub async fn new_with_grouped_checks(
+        remote_endpoint: &str, force_relay: bool, ms_timeout: u64, grouped: bool,
+    ) -> ResultType<Self> {
         let Some(rt) = WEBRTC_RT.as_ref() else {
             return Err(anyhow::anyhow!("WebRTC I/O runtime unavailable"));
         };
         let remote_endpoint = remote_endpoint.to_owned();
-        rt.spawn(Self::new_inner(remote_endpoint, force_relay, ms_timeout))
+        rt.spawn(Self::new_inner(remote_endpoint, force_relay, ms_timeout, grouped))
             .await
             .map_err(|err| anyhow::anyhow!("WebRTC setup task failed: {}", err))??
             .into_inner()
@@ -611,6 +617,7 @@ impl WebRTCStream {
         remote_endpoint: String,
         force_relay: bool,
         ms_timeout: u64,
+        grouped: bool,
     ) -> ResultType<NewStreamHandoff> {
         // The endpoint contains a Base64-encoded SDP with host addresses and live ICE
         // credentials. Log only its size so debug logs cannot disclose that information.
@@ -658,6 +665,7 @@ impl WebRTCStream {
         if !force_relay {
             s.set_ice_pace_connectivity_checks(true);
             s.set_ice_gather_interface_srflx(true);
+            s.set_grouped_physical_stun(grouped);
             if let Some(provider) = INTERFACE_STUN_FACTORY.get().and_then(|factory| factory()) {
                 s.set_ice_interface_stun_provider(provider);
             }
@@ -2715,7 +2723,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
-            .spawn(WebRTCStream::new_inner(String::new(), false, 20000))
+            .spawn(WebRTCStream::new_inner(String::new(), false, 20000, false))
             .await
             .expect("setup task")
             .expect("offerer builds");
@@ -2755,7 +2763,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
-            .spawn(WebRTCStream::new_inner(String::new(), false, 20000))
+            .spawn(WebRTCStream::new_inner(String::new(), false, 20000, false))
             .await
             .expect("setup task")
             .expect("offerer builds");

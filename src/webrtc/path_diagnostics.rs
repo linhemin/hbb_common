@@ -274,6 +274,28 @@ fn selected(c: &RTCIceCandidate) -> String {
 }
 
 impl WebRTCStream {
+    pub async fn grouped_public_candidates(&self) -> Vec<(String, SocketAddrV4, u8)> {
+        if self.relay_only { return Vec::new(); }
+        self.pc.sctp().transport().ice_transport().grouped_public_candidates().await
+    }
+
+    pub async fn grouped_pair_ingress(&self, pairs: &[(String, SocketAddrV4)]) -> Option<u8> {
+        let stats = tokio::time::timeout(BUDGET, self.pc.get_stats()).await.ok()?;
+        let mut mask = 0;
+        for item in stats.reports.values() {
+            let StatsReportType::CandidatePair(pair) = item else { continue };
+            if pair.requests_received == 0 && pair.responses_received == 0 { continue; }
+            let Some(StatsReportType::RemoteCandidate(remote)) = stats.reports.get(&pair.remote_candidate_id) else { continue };
+            for (index, (id, endpoint)) in pairs.iter().take(3).enumerate() {
+                if *id == pair.local_candidate_id && remote.port == endpoint.port()
+                    && remote.ip.parse::<Ipv4Addr>().ok() == Some(*endpoint.ip()) {
+                    mask |= 1 << index;
+                }
+            }
+        }
+        Some(mask)
+    }
+
     pub async fn timed_local_candidate(&self) -> Option<(String, SocketAddrV4)> {
         if self.relay_only { return None; }
         self.pc.sctp().transport().ice_transport().timed_local_candidate().await
@@ -286,6 +308,13 @@ impl WebRTCStream {
         };
         let Some(line) = c.candidate.strip_prefix("candidate:") else { return false };
         self.pc.sctp().transport().ice_transport().timed_first_check(local_id, line).await
+    }
+
+    pub fn public_srflx_endpoint(json: &[u8]) -> Option<SocketAddrV4> {
+        let candidate: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit = serde_json::from_slice(json).ok()?;
+        let mut fields = candidate.candidate.split_ascii_whitespace();
+        if fields.nth(1)? != "1" || fields.nth(4)? != "typ" || fields.next()? != "srflx" { return None; }
+        Self::public_udp_candidate_endpoint(json)
     }
 
     /// Address advertised by a locally generated, globally routed IPv4 UDP candidate.

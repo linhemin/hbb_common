@@ -38,6 +38,8 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 pub use webrtc::util::Conn as InterfaceStunConn;
 
+mod path_diagnostics;
+
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -2535,6 +2537,22 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
             // Host-candidate loopback is direct, never TURN-relayed.
             assert_eq!(offerer.is_relayed().await, Some(false));
+            for stream in [&offerer, &answerer] {
+                let snapshot = stream.ice_path_diagnostics().await;
+                assert!(
+                    snapshot.contains("dtls=connected sctp=connected"),
+                    "{}",
+                    snapshot
+                );
+                assert!(snapshot.contains("selected=udp/"), "{}", snapshot);
+                let exchanged = snapshot.lines().filter(|line| line.starts_with("remote="))
+                    .filter_map(|line| line.split_once(" traffic="))
+                    .filter_map(|(_, counts)| serde_json::from_str::<[u64; 6]>(counts).ok())
+                    .any(|[sent, _, received, replied, _, matched]| {
+                        (sent > 0 && matched > 0) || (received > 0 && replied > 0)
+                    });
+                assert!(exchanged, "{}", snapshot);
+            }
 
             // Small message.
             offerer.send_raw(b"hello".to_vec()).await.unwrap();

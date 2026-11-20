@@ -84,7 +84,8 @@ protobuf-codegen = { version = "3.7" }
 
 [dev-dependencies]
 clap = "4.5.51"
-webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin, see above)
+# Enable receive counters on the host running the real UDP loopback test.
+webrtc = { version = "0.13.0", features = ["ice-socket-diagnostics"] }
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -94,6 +95,6 @@ x11 = "2.21"
 # Only takes effect when this crate is built on its own (tests, examples); a consumer's own
 # [patch] governs its build. Keep the rev in lockstep with rustdesk's root Cargo.toml.
 [patch.crates-io]
-webrtc = { git = "https://github.com/linhemin/webrtc", rev = "fbc2219e3d1cbfd0d9339f94fd5c2d8f1e02bf79" }
-webrtc-util = { git = "https://github.com/linhemin/webrtc", rev = "fbc2219e3d1cbfd0d9339f94fd5c2d8f1e02bf79" }
-webrtc-sctp = { git = "https://github.com/linhemin/webrtc", rev = "fbc2219e3d1cbfd0d9339f94fd5c2d8f1e02bf79" }
+webrtc = { git = "https://github.com/linhemin/webrtc", rev = "dfba3dc17f4de5753892c24bcc5c79607ea684e4" }
+webrtc-util = { git = "https://github.com/linhemin/webrtc", rev = "dfba3dc17f4de5753892c24bcc5c79607ea684e4" }
+webrtc-sctp = { git = "https://github.com/linhemin/webrtc", rev = "dfba3dc17f4de5753892c24bcc5c79607ea684e4" }

@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 use webrtc::{
+    ice::agent::socket_diagnostics::UdpSocketDiagnostics,
     ice::candidate::{CandidatePairState, CandidateType},
     ice_transport::ice_candidate::RTCIceCandidate,
     stats::{ICECandidatePairStats, StatsReport, StatsReportType},
@@ -191,6 +192,52 @@ fn append_stats(out: &mut String, stats: &StatsReport) {
     }
 }
 
+// These counts are per agent and are emitted once, including reads rejected before a pair
+// exists. The gathering socket and the NAT64 source filter are separate observation points.
+fn append_socket_diagnostics(out: &mut String, rx: &UdpSocketDiagnostics) {
+    let _ = writeln!(
+        out,
+        "udpCandidate [readers,reads,readErrors,nonStun,stunDecodeError,bindingRequest,bindingSuccess,bindingError,bindingIndication,otherStun,bindingRequestHeader]={:?}",
+        [
+            rx.candidate_readers, rx.udp_reads, rx.udp_read_errors, rx.non_stun,
+            rx.stun_decode_error, rx.binding_request, rx.binding_success, rx.binding_error,
+            rx.binding_indication, rx.other_stun, rx.binding_request_headers,
+        ]
+    );
+    let _ = writeln!(
+        out,
+        "udpRequest [roleConflict,usernameMissing,usernameInvalid,integrityMissing,integrityInvalid,candidateFailed,accepted,knownSource,unlistedSource]={:?}",
+        [
+            rx.req_role_conflict, rx.req_username_missing, rx.req_username_invalid,
+            rx.req_integrity_missing, rx.req_integrity_invalid, rx.req_candidate_failed,
+            rx.req_accepted, rx.req_known_source, rx.req_unlisted_source,
+        ]
+    );
+    let _ = writeln!(
+        out,
+        "udpResponse [roleConflict,integrityMissing,integrityInvalid,unknownRemote,unknownTransaction,wrongEndpoint,noPair,accepted]={:?}",
+        [
+            rx.resp_role_conflict, rx.resp_integrity_missing, rx.resp_integrity_invalid,
+            rx.resp_unknown_remote, rx.resp_unknown_transaction, rx.resp_wrong_endpoint,
+            rx.resp_no_pair, rx.resp_accepted,
+        ]
+    );
+    let _ = writeln!(
+        out,
+        "udpGather [reads,bindingRequest,matchedResponse]={:?}",
+        [
+            rx.gather_reads,
+            rx.gather_binding_requests,
+            rx.gather_matched_responses
+        ]
+    );
+    let _ = writeln!(
+        out,
+        "udpNat64 [sourceDrop,bindingRequestDrop]={:?}",
+        [rx.nat64_source_drops, rx.nat64_binding_request_drops]
+    );
+}
+
 fn selected(c: &RTCIceCandidate) -> String {
     // Format only known enum types plus a scope we classified ourselves. The candidate's
     // own Display includes its raw IP, port and foundation.
@@ -211,9 +258,10 @@ impl WebRTCStream {
             sctp.state(),
             self.pc.connection_state()
         );
-        let (pair, stats) = tokio::join!(
+        let (pair, stats, socket) = tokio::join!(
             tokio::time::timeout(BUDGET, ice.get_selected_candidate_pair()),
-            tokio::time::timeout(BUDGET, self.pc.get_stats())
+            tokio::time::timeout(BUDGET, self.pc.get_stats()),
+            tokio::time::timeout(BUDGET, ice.udp_socket_diagnostics())
         );
         match pair {
             Ok(Some(pair)) => {
@@ -230,6 +278,11 @@ impl WebRTCStream {
         match stats {
             Ok(stats) => append_stats(&mut out, &stats),
             Err(_) => out.push_str("checklist=unavailable (timeout)\n"),
+        }
+        match socket {
+            Ok(Some(rx)) => append_socket_diagnostics(&mut out, &rx),
+            Ok(None) => out.push_str("udpCandidate=unavailable\n"),
+            Err(_) => out.push_str("udpCandidate=unavailable (timeout)\n"),
         }
         out
     }
@@ -352,5 +405,60 @@ mod tests {
             },
         );
         assert_eq!(text, "checklist=unavailable (no ICE reports)\n");
+    }
+
+    #[test]
+    fn socket_columns_preserve_observation_points_and_rejection_reasons() {
+        let rx = UdpSocketDiagnostics {
+            candidate_readers: 1,
+            udp_reads: 2,
+            udp_read_errors: 3,
+            non_stun: 4,
+            stun_decode_error: 5,
+            binding_request: 6,
+            binding_success: 7,
+            binding_error: 8,
+            binding_indication: 9,
+            other_stun: 10,
+            req_role_conflict: 11,
+            req_username_missing: 12,
+            req_username_invalid: 13,
+            req_integrity_missing: 14,
+            req_integrity_invalid: 15,
+            req_candidate_failed: 16,
+            req_accepted: 17,
+            resp_role_conflict: 18,
+            resp_integrity_missing: 19,
+            resp_integrity_invalid: 20,
+            resp_unknown_remote: 21,
+            resp_unknown_transaction: 22,
+            resp_wrong_endpoint: 23,
+            resp_no_pair: 24,
+            resp_accepted: 25,
+            gather_reads: 26,
+            gather_binding_requests: 27,
+            gather_matched_responses: 28,
+            nat64_source_drops: 29,
+            nat64_binding_request_drops: 30,
+            binding_request_headers: 31,
+            req_known_source: 32,
+            req_unlisted_source: 33,
+        };
+        let mut text = String::new();
+        append_socket_diagnostics(&mut text, &rx);
+        let rows = text
+            .lines()
+            .map(|line| line.split_once('=').unwrap().1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 31]",
+                "[11, 12, 13, 14, 15, 16, 17, 32, 33]",
+                "[18, 19, 20, 21, 22, 23, 24, 25]",
+                "[26, 27, 28]",
+                "[29, 30]",
+            ]
+        );
     }
 }

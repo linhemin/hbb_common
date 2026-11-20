@@ -2545,6 +2545,22 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
                     snapshot
                 );
                 assert!(snapshot.contains("selected=udp/"), "{}", snapshot);
+                let socket = stream
+                    .pc
+                    .sctp()
+                    .transport()
+                    .ice_transport()
+                    .udp_socket_diagnostics()
+                    .await
+                    .expect("missing UDP socket counters");
+                assert!(
+                    snapshot.contains("udpCandidate [readers,reads,"),
+                    "{}",
+                    snapshot
+                );
+                assert!(socket.candidate_readers > 0 && socket.udp_reads > 0);
+                assert!(socket.req_accepted > 0 || socket.resp_accepted > 0);
+                assert!(socket.binding_request_headers > 0 || socket.binding_success > 0);
                 let exchanged = snapshot.lines().filter(|line| line.starts_with("remote="))
                     .filter_map(|line| line.split_once(" traffic="))
                     .filter_map(|(_, counts)| serde_json::from_str::<[u64; 6]>(counts).ok())

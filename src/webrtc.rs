@@ -37,6 +37,7 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 pub use webrtc::util::Conn as InterfaceStunConn;
+pub use webrtc::util::Result as InterfaceStunResult;
 
 mod path_diagnostics;
 
@@ -655,6 +656,7 @@ impl WebRTCStream {
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
         if !force_relay {
+            s.set_ice_pace_connectivity_checks(true);
             s.set_ice_gather_interface_srflx(true);
             if let Some(provider) = INTERFACE_STUN_FACTORY.get().and_then(|factory| factory()) {
                 s.set_ice_interface_stun_provider(provider);
@@ -1010,6 +1012,29 @@ impl WebRTCStream {
     #[inline]
     pub fn local_endpoint(&self) -> &str {
         self.local_endpoint.as_str()
+    }
+
+    /// Supplemental candidates for the trickle channel of an authenticated relay session.
+    pub async fn gather_gateway_candidate(&self) -> Option<String> {
+        if self.relay_only {
+            return None;
+        }
+        let candidate = self.pc.sctp().transport().ice_transport()
+            .gather_gateway_candidate()
+            .await?;
+        serde_json::to_string(&candidate.to_json().ok()?).ok()
+    }
+
+    pub async fn observed_udp_candidates(&self) -> Vec<String> {
+        if self.relay_only {
+            return Vec::new();
+        }
+        self.pc.sctp().transport().ice_transport()
+            .observed_udp_candidates()
+            .await
+            .iter()
+            .filter_map(|c| serde_json::to_string(&c.to_json().ok()?).ok())
+            .collect()
     }
 
     /// The size a trickle endpoint must stay under for the UDP leg of its route to be safe. It is

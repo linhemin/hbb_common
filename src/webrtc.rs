@@ -1108,6 +1108,15 @@ impl WebRTCStream {
             .unwrap_or(false)
     }
 
+    /// A scheduled first check must start with an empty remote ICE checklist.
+    pub fn endpoint_has_no_candidates(endpoint: &str) -> bool {
+        Self::get_remote_offer(endpoint).ok()
+            .and_then(|v| serde_json::from_str::<RTCSessionDescription>(&v).ok())
+            .is_some_and(|sdp| !sdp.sdp.lines().any(|line| {
+                line.trim_start().get(..12).is_some_and(|prefix| prefix.eq_ignore_ascii_case("a=candidate:"))
+            }))
+    }
+
     #[inline]
     pub async fn set_remote_endpoint(&self, endpoint: &str) -> ResultType<()> {
         let offer = Self::get_remote_offer(endpoint)?;

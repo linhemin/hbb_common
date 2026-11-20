@@ -274,6 +274,20 @@ fn selected(c: &RTCIceCandidate) -> String {
 }
 
 impl WebRTCStream {
+    pub async fn timed_local_candidate(&self) -> Option<(String, SocketAddrV4)> {
+        if self.relay_only { return None; }
+        self.pc.sctp().transport().ice_transport().timed_local_candidate().await
+    }
+
+    pub async fn timed_first_check(&self, local_id: &str, candidate_json: &str) -> bool {
+        if self.relay_only { return false; }
+        let Ok(c) = serde_json::from_str::<webrtc::ice_transport::ice_candidate::RTCIceCandidateInit>(candidate_json) else {
+            return false;
+        };
+        let Some(line) = c.candidate.strip_prefix("candidate:") else { return false };
+        self.pc.sctp().transport().ice_transport().timed_first_check(local_id, line).await
+    }
+
     /// Address advertised by a locally generated, globally routed IPv4 UDP candidate.
     pub fn public_udp_candidate_endpoint(json: &[u8]) -> Option<SocketAddrV4> {
         let candidate: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit =

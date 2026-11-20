@@ -309,6 +309,30 @@ impl WebRTCStream {
             .await
     }
 
+    /// Direct candidate socket reads, raw STUN request headers, accepted checks,
+    /// successful response writes, failed response writes, and matched peer replies.
+    /// No addresses, credentials, SDP or media data enter this payload.
+    pub async fn direct_punch_io(&self) -> Option<[u32; 6]> {
+        if self.relay_only {
+            return None;
+        }
+        let dtls = self.pc.sctp().transport();
+        let rx = tokio::time::timeout(BUDGET, dtls.ice_transport().udp_socket_diagnostics())
+            .await
+            .ok()??;
+        Some(
+            [
+                rx.udp_reads,
+                rx.binding_request_headers,
+                rx.req_accepted,
+                rx.response_writes,
+                rx.response_write_errors,
+                rx.resp_accepted,
+            ]
+            .map(|n| n.min(u32::MAX as u64) as u32),
+        )
+    }
+
     /// A local, bounded snapshot of this stream's actual ICE checklist (never its SDP).
     /// Only fixed labels, enumerated states and counters may enter the returned text.
     pub async fn ice_path_diagnostics(&self) -> String {
@@ -532,6 +556,8 @@ mod tests {
             binding_request_headers: 31,
             req_known_source: 32,
             req_unlisted_source: 33,
+            response_writes: 34,
+            response_write_errors: 35,
         };
         let mut text = String::new();
         append_socket_diagnostics(&mut text, &rx);

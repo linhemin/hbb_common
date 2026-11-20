@@ -74,6 +74,10 @@ async-recursion = "1.1"
 webrtc = { version = "0.13.0", optional = true }
 libloading = "0.8"
 
+# The controlled Windows peer reports direct UDP reads and writes over the encrypted session.
+[target.'cfg(target_os = "windows")'.dependencies]
+webrtc = { version = "0.13.0", optional = true, features = ["ice-socket-diagnostics"] }
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 mac_address = "1.1"
 default_net = { git = "https://github.com/rustdesk-org/default_net" }

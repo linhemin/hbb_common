@@ -186,6 +186,8 @@ message KxParams {
   // The server allows endpoints to negotiate a direct path within this relay session.
   // Only meaningful inside verified signed_params. Older servers leave it false.
   bool allow_session_direct = 3;
+  // Public IPv4:port STUN observers supplied by the operator in this signed handshake.
+  repeated string udp_mapping_observers = 4;
 }
 
 message IceCandidate {

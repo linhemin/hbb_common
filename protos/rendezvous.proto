@@ -5,6 +5,7 @@ message RegisterPeer {
   string id = 1;
   int32 serial = 2;
   bool lan_probe = 3;
+  bool udp_punch_reply = 4;
 }
 
 enum ConnType {
@@ -24,6 +25,7 @@ message PunchHoleRequest {
   ConnType conn_type = 4;
   string token = 5;
   string version = 6;
+  int32 udp_port = 7;
   bool force_relay = 8;
   string webrtc_sdp_offer = 12;
   bool lan_probe = 30;
@@ -33,8 +35,10 @@ message PunchHole {
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
+  int32 udp_port = 4;
   bool force_relay = 5;
   string webrtc_sdp_offer = 10;
+  bytes udp_reply_token = 31;
 }
 
 message TestNatRequest {
@@ -60,6 +64,7 @@ message PunchHoleSent {
   NatType nat_type = 4;
   string version = 5;
   string webrtc_sdp_answer = 8;
+  bytes udp_reply_token = 31;
 }
 
 message RegisterPk {
@@ -100,6 +105,7 @@ message PunchHoleResponse {
   }
   string other_failure = 7;
   int32 feedback = 8;
+  bool is_udp = 9;
   string webrtc_sdp_answer = 12;
   bool lan_probe = 30;
 }

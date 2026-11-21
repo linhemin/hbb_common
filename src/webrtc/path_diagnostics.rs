@@ -196,6 +196,13 @@ fn append_stats(out: &mut String, stats: &StatsReport) {
 
 // These counts are per agent and are emitted once, including reads rejected before a pair
 // exists. The gathering socket and the NAT64 source filter are separate observation points.
+fn expanded_seed_counts(rx: &UdpSocketDiagnostics) -> [u64; 9] {
+    [
+        rx.seed_ipv4, rx.seed_nat64, rx.seed_bind_failed, rx.seed_sent, rx.seed_send_failed,
+        rx.seed_timeout, rx.seed_invalid_reply, rx.seed_mapping_rejected, rx.seed_verified,
+    ]
+}
+
 fn append_socket_diagnostics(out: &mut String, rx: &UdpSocketDiagnostics) {
     let _ = writeln!(
         out,
@@ -233,6 +240,19 @@ fn append_socket_diagnostics(out: &mut String, rx: &UdpSocketDiagnostics) {
             rx.gather_matched_responses
         ]
     );
+    let seed = expanded_seed_counts(rx);
+    if seed.iter().any(|count| *count != 0) {
+        let _ = writeln!(
+            out,
+            "udpFullSeed [nativeIpv4,nat64,bindFailed,sent,sendFailed,timeout,invalidReply,mappingRejected,verified]={seed:?}",
+        );
+    }
+    if rx.magic_requests != 0 || rx.magic_verified != 0 {
+        let _ = writeln!(
+            out, "udpPunchMagic [requests,verified]={:?}",
+            [rx.magic_requests, rx.magic_verified],
+        );
+    }
     let _ = writeln!(
         out,
         "udpNat64 [sourceDrop,bindingRequestDrop]={:?}",
@@ -286,6 +306,14 @@ impl WebRTCStream {
     pub async fn expanded_udp_candidates(&self) -> Vec<(String, SocketAddrV4)> {
         if self.relay_only { return Vec::new(); }
         self.pc.sctp().transport().ice_transport().expanded_udp_candidates().await
+    }
+
+    pub async fn expanded_seed_counters(&self) -> Option<[u32; 9]> {
+        let sctp = self.pc.sctp();
+        let dtls = sctp.transport();
+        let ice = dtls.ice_transport();
+        let rx = tokio::time::timeout(BUDGET, ice.udp_socket_diagnostics()).await.ok()??;
+        Some(expanded_seed_counts(&rx).map(|count| count.min(u64::from(u32::MAX)) as u32))
     }
 
     pub async fn selected_mapping_profile(&self, candidate_id: &str) -> Option<(u8, Option<u16>)> {

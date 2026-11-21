@@ -194,6 +194,19 @@ message KxParams {
   bool allow_session_direct = 3;
   // Public IPv4:port STUN observers supplied by the operator in this signed handshake.
   repeated string udp_mapping_observers = 4;
+  bool allow_p2p_feedback = 5;
+}
+
+// Numeric summaries sent only after the server advertises signed support.
+message P2pFeedback {
+  uint32 revision = 1;
+  uint32 phase = 2;
+  uint32 outcome = 3;
+  uint32 elapsed_ms = 4;
+  uint32 local_candidates = 5;
+  uint32 peer_candidates = 6;
+  uint32 probes_written = 7;
+  repeated uint32 observer_counts = 8;
 }
 
 message IceCandidate {
@@ -231,5 +244,6 @@ message RendezvousMessage {
     KeyExchange key_exchange = 25;
     HealthCheck hc = 26;
     IceCandidate ice_candidate = 29;
+    P2pFeedback p2p_feedback = 30;
   }
 }

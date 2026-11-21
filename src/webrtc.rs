@@ -77,6 +77,7 @@ pub struct WebRTCStream {
     send_timeout: u64,
     // Built with Relay-only ICE policy (force_relay): every selected pair goes through TURN.
     relay_only: bool,
+    expanded_pool: u16,
     // Detached data channel, cached after the first `detach()` so send/recv do not re-lock and
     // re-fetch it per message. Shared across clones; `detach()` is idempotent.
     detached: Arc<Mutex<Option<Arc<DetachedDataChannel>>>>,
@@ -253,6 +254,7 @@ impl Clone for WebRTCStream {
             session_key: self.session_key.clone(),
             send_timeout: self.send_timeout,
             relay_only: self.relay_only,
+            expanded_pool: self.expanded_pool,
             detached: self.detached.clone(),
             send_gate: self.send_gate.clone(),
             recv_state: self.recv_state.clone(),
@@ -357,8 +359,8 @@ impl WebRTCStream {
     /// Whether a cached `SESSIONS` entry may be handed to a caller asking for `force_relay`: it
     /// was built for the first caller, so its ICE policy may not match, and the state handler
     /// evicts late enough that dead entries linger. Both the lookup and the insert must use it.
-    fn is_reusable_for(&self, force_relay: bool) -> bool {
-        self.relay_only == force_relay
+    fn is_reusable_for(&self, force_relay: bool, full: u16) -> bool {
+        self.relay_only == force_relay && self.expanded_pool == full
             && !self.handoff.closing.load(Ordering::Acquire)
             // ICE has stopped hearing from the peer on this one. Not terminal, so nothing else
             // rejects it, but handing it to a caller that is about to judge liveness starts them
@@ -616,11 +618,22 @@ impl WebRTCStream {
     pub async fn new_with_grouped_checks(
         remote_endpoint: &str, force_relay: bool, ms_timeout: u64, grouped: bool,
     ) -> ResultType<Self> {
+        Self::new_with_punch_profile(remote_endpoint, force_relay, ms_timeout, grouped, 0).await
+    }
+
+    pub fn has_expanded_udp_observer() -> bool {
+        !mapping_observers::current().is_empty()
+    }
+
+    /// Full gathering is explicitly negotiated over an authenticated relay session.
+    pub async fn new_with_punch_profile(
+        remote_endpoint: &str, force_relay: bool, ms_timeout: u64, grouped: bool, full: u16,
+    ) -> ResultType<Self> {
         let Some(rt) = WEBRTC_RT.as_ref() else {
             return Err(anyhow::anyhow!("WebRTC I/O runtime unavailable"));
         };
         let remote_endpoint = remote_endpoint.to_owned();
-        rt.spawn(Self::new_inner(remote_endpoint, force_relay, ms_timeout, grouped))
+        rt.spawn(Self::new_inner(remote_endpoint, force_relay, ms_timeout, grouped, full))
             .await
             .map_err(|err| anyhow::anyhow!("WebRTC setup task failed: {}", err))??
             .into_inner()
@@ -632,6 +645,7 @@ impl WebRTCStream {
         force_relay: bool,
         ms_timeout: u64,
         grouped: bool,
+        full: u16,
     ) -> ResultType<NewStreamHandoff> {
         // The endpoint contains a Base64-encoded SDP with host addresses and live ICE
         // credentials. Log only its size so debug logs cannot disclose that information.
@@ -647,13 +661,22 @@ impl WebRTCStream {
 
         let mut key = Self::get_key_for_sdp_json(&remote_offer)?;
         let start_local_offer = remote_offer.is_empty();
+        let pool_observers = if full > 0 {
+            let observers = mapping_observers::current();
+            if force_relay || observers.is_empty() {
+                return Err(anyhow::anyhow!("Full ICE gathering requires a direct upgrade and a signed mapping observer"));
+            }
+            observers
+        } else {
+            Vec::new()
+        };
         if !key.is_empty() {
             // Claim inside the lock: `close_if_abandoned` commits under it too, so this hit
             // either registers in time to call that close off, or finds the entry already rejected.
             let cached = {
                 let sessions_lock = SESSIONS.lock().await;
                 match sessions_lock.get(&Self::cache_key(&key, start_local_offer)) {
-                    Some(session) if session.is_reusable_for(force_relay) => {
+                    Some(session) if session.is_reusable_for(force_relay, full) => {
                         Some(NewStreamHandoff::claim(session.clone()))
                     }
                     Some(session) => {
@@ -680,6 +703,9 @@ impl WebRTCStream {
             s.set_ice_pace_connectivity_checks(true);
             s.set_ice_gather_interface_srflx(true);
             s.set_grouped_physical_stun(grouped);
+            if full > 0 {
+                s.set_expanded_udp_pool(pool_observers, full);
+            }
             if let Some(provider) = INTERFACE_STUN_FACTORY.get().and_then(|factory| factory()) {
                 s.set_ice_interface_stun_provider(provider);
             }
@@ -951,6 +977,7 @@ impl WebRTCStream {
             session_key: key.clone(),
             send_timeout: ms_timeout,
             relay_only: force_relay,
+            expanded_pool: full,
             detached: Arc::new(Mutex::new(None)),
             send_gate: Arc::new(Semaphore::new(1)),
             recv_state: Arc::new(Mutex::new(RecvState::default())),
@@ -974,7 +1001,7 @@ impl WebRTCStream {
             // rejected there is still in the map when we get here, so returning it unconditionally
             // would discard the pc we just built precisely because the cached one was unusable.
             match final_lock.get(&cache_key) {
-                Some(session) if session.is_reusable_for(force_relay) => {
+                Some(session) if session.is_reusable_for(force_relay, full) => {
                     duplicate = Some(webrtc_stream.clone());
                     NewStreamHandoff::claim(session.clone())
                 }
@@ -2737,7 +2764,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
-            .spawn(WebRTCStream::new_inner(String::new(), false, 20000, false))
+            .spawn(WebRTCStream::new_inner(String::new(), false, 20000, false, 0))
             .await
             .expect("setup task")
             .expect("offerer builds");
@@ -2777,7 +2804,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
-            .spawn(WebRTCStream::new_inner(String::new(), false, 20000, false))
+            .spawn(WebRTCStream::new_inner(String::new(), false, 20000, false, 0))
             .await
             .expect("setup task")
             .expect("offerer builds");

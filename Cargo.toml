@@ -99,6 +99,6 @@ x11 = "2.21"
 # Only takes effect when this crate is built on its own (tests, examples); a consumer's own
 # [patch] governs its build. Keep the rev in lockstep with rustdesk's root Cargo.toml.
 [patch.crates-io]
-webrtc = { git = "https://github.com/linhemin/webrtc", rev = "e8494ffcb6944d3c47b59f331862113e36235676" }
-webrtc-util = { git = "https://github.com/linhemin/webrtc", rev = "e8494ffcb6944d3c47b59f331862113e36235676" }
-webrtc-sctp = { git = "https://github.com/linhemin/webrtc", rev = "e8494ffcb6944d3c47b59f331862113e36235676" }
+webrtc = { git = "https://github.com/linhemin/webrtc", rev = "6b292f94e6ccc4652f816452022161567d161bbb" }
+webrtc-util = { git = "https://github.com/linhemin/webrtc", rev = "6b292f94e6ccc4652f816452022161567d161bbb" }
+webrtc-sctp = { git = "https://github.com/linhemin/webrtc", rev = "6b292f94e6ccc4652f816452022161567d161bbb" }

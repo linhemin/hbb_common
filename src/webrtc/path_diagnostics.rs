@@ -279,26 +279,76 @@ fn selected(c: &RTCIceCandidate) -> String {
 impl WebRTCStream {
     pub(super) fn is_public_v4(ip: Ipv4Addr) -> bool { Scope::v4(ip) == Scope::Public4 }
 
+    pub async fn expanded_udp_pool_complete(&self) -> bool {
+        self.relay_only || self.pc.sctp().transport().ice_transport().expanded_udp_pool_complete().await
+    }
+
+    pub async fn expanded_udp_candidates(&self) -> Vec<(String, SocketAddrV4)> {
+        if self.relay_only { return Vec::new(); }
+        self.pc.sctp().transport().ice_transport().expanded_udp_candidates().await
+    }
+
+    pub async fn selected_mapping_profile(&self, candidate_id: &str) -> Option<(u8, Option<u16>)> {
+        self.pc.sctp().transport().ice_transport().selected_mapping_profile(candidate_id).await
+    }
+
+    pub async fn release_unused_expanded_ports(&self) {
+        self.pc.sctp().transport().ice_transport().release_unused_expanded_ports().await;
+    }
+
+    pub fn valid_expanded_endpoint(endpoint: SocketAddrV4) -> bool {
+        endpoint.port() > 0 && Self::is_public_v4(*endpoint.ip())
+    }
+
+    pub async fn expanded_first_check(&self, local_id: &str, endpoint: SocketAddrV4) -> bool {
+        if self.expanded_pool == 0 || !Self::valid_expanded_endpoint(endpoint) {
+            return false;
+        }
+        let line = format!("1 1 udp 1694498815 {} {} typ srflx raddr 0.0.0.0 rport 0",
+            endpoint.ip(), endpoint.port());
+        self.pc.sctp().transport().ice_transport().timed_first_check(local_id, &line).await
+    }
+
     pub async fn grouped_public_candidates(&self) -> Vec<(String, SocketAddrV4, u8)> {
         if self.relay_only { return Vec::new(); }
         self.pc.sctp().transport().ice_transport().grouped_public_candidates().await
     }
 
     pub async fn grouped_pair_ingress(&self, pairs: &[(String, SocketAddrV4)]) -> Option<u8> {
+        let received = self.pair_ingress(&pairs[..pairs.len().min(3)]).await?;
+        Some(received.iter().enumerate().fold(0u8, |mask, (i, seen)| mask | (u8::from(*seen) << i)))
+    }
+
+    pub async fn expanded_pair_ingress(&self, pairs: &HashSet<(String, SocketAddrV4)>) -> Option<usize> {
+        if pairs.is_empty() {
+            return Some(0);
+        }
         let stats = tokio::time::timeout(BUDGET, self.pc.get_stats()).await.ok()?;
-        let mut mask = 0;
+        Some(stats.reports.values().filter(|item| {
+            let StatsReportType::CandidatePair(pair) = item else { return false };
+            if pair.requests_received == 0 && pair.responses_received == 0 { return false; }
+            let Some(StatsReportType::RemoteCandidate(remote)) = stats.reports.get(&pair.remote_candidate_id) else { return false };
+            let Ok(ip) = remote.ip.parse::<Ipv4Addr>() else { return false };
+            pairs.contains(&(pair.local_candidate_id.clone(), SocketAddrV4::new(ip, remote.port)))
+        }).count())
+    }
+
+    async fn pair_ingress(&self, pairs: &[(String, SocketAddrV4)]) -> Option<Vec<bool>> {
+        let stats = tokio::time::timeout(BUDGET, self.pc.get_stats()).await.ok()?;
+        let mut received = vec![false; pairs.len()];
         for item in stats.reports.values() {
             let StatsReportType::CandidatePair(pair) = item else { continue };
             if pair.requests_received == 0 && pair.responses_received == 0 { continue; }
             let Some(StatsReportType::RemoteCandidate(remote)) = stats.reports.get(&pair.remote_candidate_id) else { continue };
-            for (index, (id, endpoint)) in pairs.iter().take(3).enumerate() {
-                if *id == pair.local_candidate_id && remote.port == endpoint.port()
-                    && remote.ip.parse::<Ipv4Addr>().ok() == Some(*endpoint.ip()) {
-                    mask |= 1 << index;
+            let Ok(ip) = remote.ip.parse::<Ipv4Addr>() else { continue };
+            let endpoint = SocketAddrV4::new(ip, remote.port);
+            for (index, (id, target)) in pairs.iter().enumerate() {
+                if *id == pair.local_candidate_id && *target == endpoint {
+                    received[index] = true;
                 }
             }
         }
-        Some(mask)
+        Some(received)
     }
 
     pub async fn timed_local_candidate(&self) -> Option<(String, SocketAddrV4)> {

@@ -5,6 +5,7 @@ use futures::{SinkExt, StreamExt};
 use protobuf::Message;
 use sodiumoxide::crypto::{
     box_,
+    generichash,
     secretbox::{self, Key, Nonce},
 };
 use std::{
@@ -24,8 +25,22 @@ use tokio_util::codec::Framed;
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
+// Match the directional key exchange in the RustDesk desktop and mobile clients.
+pub const KX_VERSION_LATEST: u32 = 1;
+pub const KX_PARAMS_DOMAIN: &[u8] = b"rdkx-params";
+const KX_SPLIT_CONTEXT: &[u8] = b"rdkx-spl";
+const KX_SPLIT_INITIATOR: u8 = 1;
+const KX_SPLIT_RESPONDER: u8 = 2;
+
+pub struct KxTranscript<'a> {
+    pub initiator_pk: &'a [u8],
+    pub responder_pk: &'a [u8],
+    pub advertised: u32,
+    pub picked: u32,
+}
+
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64);
+pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>);
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -131,6 +146,10 @@ impl FramedStream {
         self.3 = ms;
     }
 
+    pub fn set_max_packet_length(&mut self, len: usize) {
+        self.0.codec_mut().set_max_packet_length(len);
+    }
+
     pub fn from(stream: impl TcpStreamTrait + Send + Sync + 'static, addr: SocketAddr) -> Self {
         Self(
             Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
@@ -198,6 +217,16 @@ impl FramedStream {
 
     pub fn set_key(&mut self, key: Key) {
         self.2 = Some(Encrypt::new(key));
+    }
+
+    pub fn set_key_split(
+        &mut self,
+        key: Key,
+        is_initiator: bool,
+        transcript: &KxTranscript,
+    ) -> ResultType<()> {
+        self.2 = Some(Encrypt::new_split(key, is_initiator, transcript)?);
+        Ok(())
     }
 
     fn get_nonce(seqnum: u64) -> Nonce {
@@ -295,7 +324,41 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+        Self(key, 0, 0, None)
+    }
+
+    pub fn new_split(key: Key, is_initiator: bool, t: &KxTranscript) -> ResultType<Self> {
+        let initiator = Self::derive_subkey(&key, KX_SPLIT_INITIATOR, t)?;
+        let responder = Self::derive_subkey(&key, KX_SPLIT_RESPONDER, t)?;
+        Ok(if is_initiator {
+            Self(initiator, 0, 0, Some(responder))
+        } else {
+            Self(responder, 0, 0, Some(initiator))
+        })
+    }
+
+    fn derive_subkey(key: &Key, direction: u8, t: &KxTranscript) -> ResultType<Key> {
+        if t.initiator_pk.len() != box_::PUBLICKEYBYTES
+            || t.responder_pk.len() != box_::PUBLICKEYBYTES
+        {
+            bail!("key exchange transcript has a public key of the wrong length");
+        }
+        let failed = |_| anyhow::anyhow!("key derivation failed");
+        let mut hash =
+            generichash::State::new(Some(secretbox::KEYBYTES), Some(&key.0)).map_err(failed)?;
+        for part in [
+            KX_SPLIT_CONTEXT,
+            &[direction],
+            &t.advertised.to_le_bytes(),
+            &t.picked.to_le_bytes(),
+            t.initiator_pk,
+            t.responder_pk,
+        ] {
+            hash.update(part).map_err(failed)?;
+        }
+        let mut key = [0u8; secretbox::KEYBYTES];
+        key.copy_from_slice(hash.finalize().map_err(failed)?.as_ref());
+        Ok(Key(key))
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
@@ -304,7 +367,7 @@ impl Encrypt {
         }
         self.2 += 1;
         let nonce = FramedStream::get_nonce(self.2);
-        match secretbox::open(bytes, &nonce, &self.0) {
+        match secretbox::open(bytes, &nonce, self.3.as_ref().unwrap_or(&self.0)) {
             Ok(res) => {
                 bytes.clear();
                 bytes.put_slice(&res);

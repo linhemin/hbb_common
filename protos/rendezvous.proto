@@ -16,6 +16,7 @@ message RegisterPeer {
   string id = 1;
   int32 serial = 2;
   bool lan_probe = 3;
+  bool udp_punch_reply = 4;
 }
 
 enum ConnType {
@@ -83,6 +84,7 @@ message PunchHole {
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
+  bytes udp_reply_token = 31;
 }
 
 message TestNatRequest {
@@ -110,6 +112,7 @@ message PunchHoleSent {
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
   string webrtc_sdp_answer = 8;
+  bytes udp_reply_token = 31;
 }
 
 message RegisterPk {

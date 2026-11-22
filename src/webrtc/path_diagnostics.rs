@@ -741,6 +741,7 @@ mod tests {
             req_unlisted_source: 33,
             response_writes: 34,
             response_write_errors: 35,
+            ..Default::default()
         };
         let mut text = String::new();
         append_socket_diagnostics(&mut text, &rx);

@@ -31,6 +31,7 @@ enum ConnType {
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
+  bytes udp_mapping_tickets = 33;
   string id = 1; 
   NatType nat_type = 2;
   string licence_key = 3;
@@ -75,6 +76,7 @@ message ControlledContext {
 }
 
 message PunchHole {
+  repeated uint32 udp_candidate_ports = 33;
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
@@ -108,6 +110,7 @@ enum NatType {
 }
 
 message PunchHoleSent {
+  bytes udp_mapping_tickets = 33;
   bytes socket_addr = 1;
   string id = 2;
   string relay_server = 3;
@@ -143,6 +146,8 @@ message RegisterPkResponse {
 }
 
 message PunchHoleResponse {
+  repeated uint32 udp_candidate_ports = 33;
+  bytes udp_probe_key = 34;
   bytes socket_addr = 1;
   bytes pk = 2;
   enum Failure {

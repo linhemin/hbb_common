@@ -779,7 +779,7 @@ impl WebRTCStream {
         if !force_relay {
             s.set_ice_pace_connectivity_checks(true);
             s.set_ice_gather_interface_srflx(true);
-            s.set_grouped_physical_stun(grouped);
+            s.set_grouped_physical_stun(grouped || policy == IcePolicy::DirectOnly);
             if full > 0 {
                 s.set_expanded_udp_pool(pool_observers, full);
             }

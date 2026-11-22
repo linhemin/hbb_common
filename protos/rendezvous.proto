@@ -47,6 +47,7 @@ message PunchHoleRequest {
   // transport-forced (WebSocket — answer may use full ICE) or policy (Relay-only + TURN).
   string webrtc_sdp_offer = 12;
   bool lan_probe = 30;
+  bool direct_only = 40;
 }
 
 message ControlPermissions {
@@ -85,6 +86,7 @@ message PunchHole {
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
   bytes udp_reply_token = 31;
+  bool direct_only = 40;
 }
 
 message TestNatRequest {
@@ -210,6 +212,7 @@ message FetchLocalAddr {
   ControlPermissions control_permissions = 4;
   ControlledContext controlled_context = 5;
   bool lan_probe = 30;
+  bool direct_only = 40;
 }
 
 message LocalAddr {

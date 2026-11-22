@@ -71,6 +71,8 @@ message PunchHole {
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
   bytes udp_reply_token = 31;
+  // Operator-owned WAN IPv4 of a NAT shared with hbbs. The observed source remains in socket_addr.
+  bytes shared_egress_ipv4 = 32;
   bool direct_only = 40;
 }
 

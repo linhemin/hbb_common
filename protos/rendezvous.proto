@@ -129,6 +129,7 @@ message PunchHoleSent {
 }
 
 message RegisterPk {
+  bytes stream_nonce = 46;
   string id = 1;
   bytes uuid = 2;
   bytes pk = 3;
@@ -322,6 +323,11 @@ message IceCandidate {
   string candidate = 4;
 }
 
+message DeviceStreamProof {
+  bytes challenge = 1;
+  bytes signature = 2;
+}
+
 message RendezvousMessage {
   oneof union {
     RegisterPeer register_peer = 6;
@@ -349,5 +355,6 @@ message RendezvousMessage {
     HttpProxyResponse http_proxy_response = 28;
     IceCandidate ice_candidate = 29;
     P2pFeedback p2p_feedback = 30;
+    DeviceStreamProof device_stream_proof = 33;
   }
 }

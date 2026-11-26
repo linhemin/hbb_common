@@ -2,6 +2,7 @@ syntax = "proto3";
 package hbb;
 
 message RegisterPeer {
+  bool supports_session_relays = 47;
   string id = 1;
   int32 serial = 2;
   bool lan_probe = 3;
@@ -21,6 +22,7 @@ enum ConnType {
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
+  SessionRelayList session_relays = 47;
   bool allow_relay_ice = 44;
   bool prefer_relay_start = 43;
   bytes websocket_path_ticket = 42;
@@ -68,6 +70,7 @@ message ControlledContext {
 }
 
 message PunchHole {
+  SessionRelayList session_relays = 47;
   bytes relay_start_token = 45;
   bool allow_relay_ice = 44;
   bool prefer_relay_start = 43;
@@ -109,6 +112,7 @@ enum NatType {
 }
 
 message PunchHoleSent {
+  SessionRelayList session_relays = 47;
   bool websocket_path = 42;
   bytes udp_mapping_tickets = 33;
   string udp_lan_endpoint = 35;
@@ -124,6 +128,7 @@ message PunchHoleSent {
 }
 
 message RegisterPk {
+  bool supports_session_relays = 47;
   bytes stream_nonce = 46;
   string id = 1;
   bytes uuid = 2;
@@ -148,6 +153,7 @@ message RegisterPkResponse {
 }
 
 message PunchHoleResponse {
+  SessionRelayList session_relays = 47;
   bool websocket_path = 42;
   repeated uint32 udp_candidate_ports = 33;
   string udp_lan_endpoint = 35;
@@ -181,6 +187,7 @@ message ConfigUpdate {
 }
 
 message RequestRelay {
+  SessionRelayList session_relays = 47;
   string id = 1;
   string uuid = 2;
   bytes socket_addr = 3;
@@ -195,6 +202,7 @@ message RequestRelay {
 }
 
 message RelayResponse {
+  SessionRelayList session_relays = 47;
   bytes relay_start_token = 45;
   bool prefer_relay_start = 43;
   bytes socket_addr = 1;
@@ -219,6 +227,7 @@ message SoftwareUpdate { string url = 1; }
 //  { kind: Other, error: "could not resolve to any address" },
 // so we request local address to connect.
 message FetchLocalAddr {
+  SessionRelayList session_relays = 47;
   repeated RegionalRelaySample relay_samples = 41;
   bytes socket_addr = 1;
   string relay_server = 2;
@@ -230,6 +239,7 @@ message FetchLocalAddr {
 }
 
 message LocalAddr {
+  SessionRelayList session_relays = 47;
   bytes socket_addr = 1;
   bytes local_addr = 2;
   string relay_server = 3;
@@ -316,6 +326,13 @@ message HttpProxyResponse {
   repeated HeaderEntry headers = 2;
   bytes body = 3;
   string error = 4;
+}
+
+// Presence means both endpoints must explicitly agree to any relay.
+message SessionRelayList {
+  repeated string servers = 1;
+  // On bounded UDP offers only: concatenated 16-byte SHA-256 prefixes of the canonical servers.
+  bytes packed_hashes = 2;
 }
 
 message RegionalRelayDirectory {

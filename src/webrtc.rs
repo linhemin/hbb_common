@@ -658,7 +658,13 @@ impl WebRTCStream {
 
     /// Negotiate a direct ICE path on both endpoints, including later trickled candidates.
     pub async fn new_direct_only(remote_endpoint: &str, ms_timeout: u64) -> ResultType<Self> {
-        Self::new_with_policy(remote_endpoint, IcePolicy::DirectOnly, ms_timeout, false, 0).await
+        Self::new_direct_with_punch_profile(remote_endpoint, ms_timeout, false, 0).await
+    }
+
+    pub async fn new_direct_with_punch_profile(
+        remote_endpoint: &str, ms_timeout: u64, grouped: bool, full: u16,
+    ) -> ResultType<Self> {
+        Self::new_with_policy(remote_endpoint, IcePolicy::DirectOnly, ms_timeout, grouped, full).await
     }
 
     pub fn has_expanded_udp_observer() -> bool {

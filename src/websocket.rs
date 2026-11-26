@@ -35,6 +35,8 @@ use tokio_tungstenite::{
 };
 use tungstenite::client::IntoClientRequest;
 
+mod peer;
+
 /// tungstenite's own defaults. `set_max_packet_length` clamps to these, so `usize::MAX` puts the
 /// transport back exactly where it started rather than above it.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;

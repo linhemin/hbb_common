@@ -21,6 +21,7 @@ enum ConnType {
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
+  repeated RegionalRelaySample relay_samples = 41;
   bytes udp_mapping_tickets = 33;
   uint32 udp_observed_ipv4 = 36;
   string udp_lan_endpoint = 35;
@@ -64,6 +65,7 @@ message ControlledContext {
 }
 
 message PunchHole {
+  repeated RegionalRelaySample relay_samples = 41;
   repeated uint32 udp_candidate_ports = 33;
   uint32 udp_observed_ipv4 = 36;
   string udp_lan_endpoint = 35;
@@ -205,6 +207,7 @@ message SoftwareUpdate { string url = 1; }
 //  { kind: Other, error: "could not resolve to any address" },
 // so we request local address to connect.
 message FetchLocalAddr {
+  repeated RegionalRelaySample relay_samples = 41;
   bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
@@ -258,6 +261,7 @@ message KxParams {
   // Public IPv4:port STUN observers supplied by the operator in this signed handshake.
   repeated string udp_mapping_observers = 4;
   bool allow_p2p_feedback = 5;
+  bool regional_relay_directory = 7;
 }
 
 // Numeric summaries sent only after the server advertises signed support.
@@ -302,6 +306,22 @@ message HttpProxyResponse {
   string error = 4;
 }
 
+message RegionalRelayDirectory {
+  repeated string relay_servers = 1;
+  fixed64 nonce = 2;
+  bytes signature = 3;
+  bool allow_session_direct = 4;
+}
+
+message RegionalRelaySample {
+  string relay_server = 1;
+  uint32 connect_ms = 2;
+}
+
+message RegionalRelayPing {
+  fixed64 nonce = 1;
+}
+
 message RendezvousMessage {
   oneof union {
     RegisterPeer register_peer = 6;
@@ -329,5 +349,7 @@ message RendezvousMessage {
     HttpProxyResponse http_proxy_response = 28;
     IceCandidate ice_candidate = 29;
     P2pFeedback p2p_feedback = 30;
+    RegionalRelayDirectory regional_relay_directory = 31;
+    RegionalRelayPing regional_relay_ping = 32;
   }
 }

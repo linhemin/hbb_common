@@ -21,6 +21,9 @@ enum ConnType {
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
+  bool allow_relay_ice = 44;
+  bool prefer_relay_start = 43;
+  bytes websocket_path_ticket = 42;
   repeated RegionalRelaySample relay_samples = 41;
   bytes udp_mapping_tickets = 33;
   uint32 udp_observed_ipv4 = 36;
@@ -65,6 +68,10 @@ message ControlledContext {
 }
 
 message PunchHole {
+  bytes relay_start_token = 45;
+  bool allow_relay_ice = 44;
+  bool prefer_relay_start = 43;
+  bytes websocket_path_ticket = 42;
   repeated RegionalRelaySample relay_samples = 41;
   repeated uint32 udp_candidate_ports = 33;
   uint32 udp_observed_ipv4 = 36;
@@ -102,6 +109,7 @@ enum NatType {
 }
 
 message PunchHoleSent {
+  bool websocket_path = 42;
   bytes udp_mapping_tickets = 33;
   string udp_lan_endpoint = 35;
   bytes socket_addr = 1;
@@ -139,6 +147,7 @@ message RegisterPkResponse {
 }
 
 message PunchHoleResponse {
+  bool websocket_path = 42;
   repeated uint32 udp_candidate_ports = 33;
   string udp_lan_endpoint = 35;
   bytes udp_probe_key = 34;
@@ -185,6 +194,8 @@ message RequestRelay {
 }
 
 message RelayResponse {
+  bytes relay_start_token = 45;
+  bool prefer_relay_start = 43;
   bytes socket_addr = 1;
   string uuid = 2;
   string relay_server = 3;

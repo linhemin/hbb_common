@@ -124,6 +124,7 @@ message PunchHoleSent {
 }
 
 message RegisterPk {
+  bytes stream_nonce = 46;
   string id = 1;
   bytes uuid = 2;
   bytes pk = 3;
@@ -333,6 +334,11 @@ message RegionalRelayPing {
   fixed64 nonce = 1;
 }
 
+message DeviceStreamProof {
+  bytes challenge = 1;
+  bytes signature = 2;
+}
+
 message RendezvousMessage {
   oneof union {
     RegisterPeer register_peer = 6;
@@ -362,5 +368,6 @@ message RendezvousMessage {
     P2pFeedback p2p_feedback = 30;
     RegionalRelayDirectory regional_relay_directory = 31;
     RegionalRelayPing regional_relay_ping = 32;
+    DeviceStreamProof device_stream_proof = 33;
   }
 }

@@ -34,6 +34,8 @@ use tokio_tungstenite::{
 };
 use tungstenite::client::IntoClientRequest;
 
+mod peer;
+
 /// tungstenite's own defaults. `set_max_packet_length` clamps to these, so `usize::MAX` puts the
 /// transport back exactly where it started rather than above it.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
@@ -82,6 +84,7 @@ type WsStream = Either<
 
 pub struct WsFramedStream {
     stream: WsStream,
+    verified_tls: bool,
     addr: SocketAddr,
     encrypt: Option<Encrypt>,
     send_timeout: u64,
@@ -299,17 +302,42 @@ impl WsFramedStream {
         }
     }
 
+    /// Operator directory lookups require verified TLS even if the media path allows a
+    /// self-signed certificate. Do not inherit the ordinary connection's retry policy.
+    pub async fn new_verified_wss(url: &str, ms_timeout: u64) -> ResultType<Self> {
+        Self::verified_wss(url, None, ms_timeout).await
+    }
+
+    pub fn has_verified_tls(&self) -> bool {
+        self.verified_tls
+    }
+
+    async fn verified_wss(url: &str, local_addr: Option<SocketAddr>, ms_timeout: u64) -> ResultType<Self> {
+        if !url.starts_with("wss://") {
+            anyhow::bail!("Expected a secure WebSocket endpoint");
+        }
+        let proxy = Config::get_socks();
+        let (stream, addr) = Self::try_connect(
+            url, local_addr, proxy.as_ref(), ms_timeout, TlsType::Rustls, false, Some(false), Some(false),
+        ).await?;
+        Ok(Self { stream, addr, encrypt: None, send_timeout: ms_timeout, verified_tls: true })
+    }
+
     pub async fn new<T: AsRef<str>>(
         url: T,
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        if !use_ws() && url.as_ref().starts_with("wss://") {
+            return Self::verified_wss(url.as_ref(), local_addr, ms_timeout).await;
+        }
         let proxy_conf = Config::get_socks();
         let (stream, addr) =
             Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout).await?;
 
         let ws = Self {
             stream,
+            verified_tls: false,
             addr,
             encrypt: None,
             send_timeout: ms_timeout,
@@ -590,6 +618,7 @@ mod tests {
 
         WsFramedStream {
             stream: Either::Left(ws_stream),
+            verified_tls: false,
             addr,
             encrypt: None,
             send_timeout: 0,

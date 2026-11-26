@@ -13,8 +13,12 @@ message IdPk {
 }
 
 message RegisterPeer {
+  bool supports_session_relays = 47;
   string id = 1;
   int32 serial = 2;
+  bool lan_probe = 3;
+  bool udp_punch_reply = 4;
+  bool udp_endpoint_candidates = 5;
 }
 
 enum ConnType {
@@ -29,6 +33,14 @@ enum ConnType {
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
+  SessionRelayList session_relays = 47;
+  bool allow_relay_ice = 44;
+  bool prefer_relay_start = 43;
+  bytes websocket_path_ticket = 42;
+  repeated RegionalRelaySample relay_samples = 41;
+  bytes udp_mapping_tickets = 33;
+  uint32 udp_observed_ipv4 = 36;
+  string udp_lan_endpoint = 35;
   string id = 1; 
   NatType nat_type = 2;
   string licence_key = 3;
@@ -44,6 +56,8 @@ message PunchHoleRequest {
   // the webrtc:// payload): under force_relay it tells the peer whether the relay is
   // transport-forced (WebSocket — answer may use full ICE) or policy (Relay-only + TURN).
   string webrtc_sdp_offer = 12;
+  bool lan_probe = 30;
+  bool direct_only = 40;
 }
 
 message ControlPermissions {
@@ -71,6 +85,15 @@ message ControlledContext {
 }
 
 message PunchHole {
+  SessionRelayList session_relays = 47;
+  bytes relay_start_token = 45;
+  bool allow_relay_ice = 44;
+  bool prefer_relay_start = 43;
+  bytes websocket_path_ticket = 42;
+  repeated RegionalRelaySample relay_samples = 41;
+  repeated uint32 udp_candidate_ports = 33;
+  uint32 udp_observed_ipv4 = 36;
+  string udp_lan_endpoint = 35;
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
@@ -81,6 +104,10 @@ message PunchHole {
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
+  bytes udp_reply_token = 31;
+  // Operator-owned WAN IPv4 of a NAT shared with hbbs. The observed source remains in socket_addr.
+  bytes shared_egress_ipv4 = 32;
+  bool direct_only = 40;
 }
 
 message TestNatRequest {
@@ -100,6 +127,10 @@ enum NatType {
 }
 
 message PunchHoleSent {
+  SessionRelayList session_relays = 47;
+  bool websocket_path = 42;
+  bytes udp_mapping_tickets = 33;
+  string udp_lan_endpoint = 35;
   bytes socket_addr = 1;
   string id = 2;
   string relay_server = 3;
@@ -108,9 +139,12 @@ message PunchHoleSent {
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
   string webrtc_sdp_answer = 8;
+  bytes udp_reply_token = 31;
 }
 
 message RegisterPk {
+  bool supports_session_relays = 47;
+  bytes stream_nonce = 46;
   string id = 1;
   bytes uuid = 2;
   bytes pk = 3;
@@ -134,6 +168,11 @@ message RegisterPkResponse {
 }
 
 message PunchHoleResponse {
+  SessionRelayList session_relays = 47;
+  bool websocket_path = 42;
+  repeated uint32 udp_candidate_ports = 33;
+  string udp_lan_endpoint = 35;
+  bytes udp_probe_key = 34;
   bytes socket_addr = 1;
   bytes pk = 2;
   enum Failure {
@@ -154,6 +193,7 @@ message PunchHoleResponse {
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
   string webrtc_sdp_answer = 12;
+  bool lan_probe = 30;
 }
 
 message ConfigUpdate {
@@ -162,6 +202,7 @@ message ConfigUpdate {
 }
 
 message RequestRelay {
+  SessionRelayList session_relays = 47;
   string id = 1;
   string uuid = 2;
   bytes socket_addr = 3;
@@ -176,6 +217,9 @@ message RequestRelay {
 }
 
 message RelayResponse {
+  SessionRelayList session_relays = 47;
+  bytes relay_start_token = 45;
+  bool prefer_relay_start = 43;
   bytes socket_addr = 1;
   string uuid = 2;
   string relay_server = 3;
@@ -198,20 +242,26 @@ message SoftwareUpdate { string url = 1; }
 //  { kind: Other, error: "could not resolve to any address" },
 // so we request local address to connect.
 message FetchLocalAddr {
+  SessionRelayList session_relays = 47;
+  repeated RegionalRelaySample relay_samples = 41;
   bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
   ControlPermissions control_permissions = 4;
   ControlledContext controlled_context = 5;
+  bool lan_probe = 30;
+  bool direct_only = 40;
 }
 
 message LocalAddr {
+  SessionRelayList session_relays = 47;
   bytes socket_addr = 1;
   bytes local_addr = 2;
   string relay_server = 3;
   string id = 4;
   string version = 5;
   bytes socket_addr_v6 = 6;
+  bool lan_probe = 30;
 }
 
 message PeerDiscovery {
@@ -248,6 +298,24 @@ message KeyExchange {
 message KxParams {
   bytes pk = 1;
   uint32 version = 2;
+  // Authenticated opt-in to retrying direct paths during an established relay session.
+  bool allow_session_direct = 3;
+  // Public IPv4:port STUN observers supplied by the operator in this signed handshake.
+  repeated string udp_mapping_observers = 4;
+  bool allow_p2p_feedback = 5;
+  bool regional_relay_directory = 7;
+}
+
+// Numeric summaries sent only after the server advertises signed support.
+message P2pFeedback {
+  uint32 revision = 1;
+  uint32 phase = 2;
+  uint32 outcome = 3;
+  uint32 elapsed_ms = 4;
+  uint32 local_candidates = 5;
+  uint32 peer_candidates = 6;
+  uint32 probes_written = 7;
+  repeated uint32 observer_counts = 8;
 }
 
 message HealthCheck {
@@ -280,6 +348,34 @@ message IceCandidate {
   string candidate = 4;
 }
 
+// Presence means both endpoints must explicitly agree to any relay.
+message SessionRelayList {
+  repeated string servers = 1;
+  // On bounded UDP offers only: concatenated 16-byte SHA-256 prefixes of the canonical servers.
+  bytes packed_hashes = 2;
+}
+
+message RegionalRelayDirectory {
+  repeated string relay_servers = 1;
+  fixed64 nonce = 2;
+  bytes signature = 3;
+  bool allow_session_direct = 4;
+}
+
+message RegionalRelaySample {
+  string relay_server = 1;
+  uint32 connect_ms = 2;
+}
+
+message RegionalRelayPing {
+  fixed64 nonce = 1;
+}
+
+message DeviceStreamProof {
+  bytes challenge = 1;
+  bytes signature = 2;
+}
+
 message RendezvousMessage {
   oneof union {
     RegisterPeer register_peer = 6;
@@ -306,5 +402,9 @@ message RendezvousMessage {
     HttpProxyRequest http_proxy_request = 27;
     HttpProxyResponse http_proxy_response = 28;
     IceCandidate ice_candidate = 29;
+    P2pFeedback p2p_feedback = 30;
+    RegionalRelayDirectory regional_relay_directory = 31;
+    RegionalRelayPing regional_relay_ping = 32;
+    DeviceStreamProof device_stream_proof = 33;
   }
 }

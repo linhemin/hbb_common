@@ -60,7 +60,7 @@ pub struct KxTranscript<'a> {
 
 /// The sending key, the send and receive counters, and the receiving key where it differs.
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>);
+pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>, Option<(String, Vec<String>)>);
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -165,6 +165,17 @@ impl FramedStream {
     {
         let proxy = Proxy::from_conf(proxy_conf, Some(ms_timeout))?;
         proxy.connect::<T>(target, local_addr).await
+    }
+
+    // Observer hints may be activated only after a round trip with this session key.
+    pub fn stage_signed_observers(&mut self, key: &str, observers: Vec<String>) {
+        if let Some(cipher) = self.2.as_mut() {
+            cipher.4 = Some((key.to_owned(), observers.into_iter().take(4).collect()));
+        }
+    }
+
+    pub fn take_signed_observers(&mut self) -> Option<(String, Vec<String>)> {
+        self.2.as_mut()?.4.take()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -349,7 +360,7 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0, None)
+        Self(key, 0, 0, None, None)
     }
 
     /// Version 1: the initiator, the side that sent the sealed key, sends under one subkey and
@@ -358,9 +369,9 @@ impl Encrypt {
         let initiator = Self::derive_subkey(&key, KX_SPLIT_INITIATOR, t)?;
         let responder = Self::derive_subkey(&key, KX_SPLIT_RESPONDER, t)?;
         Ok(if is_initiator {
-            Self(initiator, 0, 0, Some(responder))
+            Self(initiator, 0, 0, Some(responder), None)
         } else {
-            Self(responder, 0, 0, Some(initiator))
+            Self(responder, 0, 0, Some(initiator), None)
         })
     }
 
@@ -482,7 +493,7 @@ mod tests {
             advertised: 1,
             picked: 1,
         };
-        let Encrypt(send, _, _, recv) = Encrypt::new_split(key.clone(), true, &t).unwrap();
+        let Encrypt(send, _, _, recv, ..) = Encrypt::new_split(key.clone(), true, &t).unwrap();
         assert_eq!(
             hex(&send.0),
             "c189ec6e1935c0751cfc85a0f075405cae507d7925bb19687caf56cbb54e0ecf"
@@ -493,7 +504,7 @@ mod tests {
         );
         // With the two versions equal, swapping their order in the derivation would go unseen.
         t.advertised = 3;
-        let Encrypt(send, _, _, recv) = Encrypt::new_split(key, true, &t).unwrap();
+        let Encrypt(send, _, _, recv, ..) = Encrypt::new_split(key, true, &t).unwrap();
         assert_eq!(
             hex(&send.0),
             "25b0778ae600f9731c7fa457d1cc5d40071b0aa3d34c90b53e1d5344b0e7123a"

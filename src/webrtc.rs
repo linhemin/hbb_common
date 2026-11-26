@@ -13,8 +13,6 @@
 //! - `on_*` handlers live in the pc: one holding a strong `Arc<RTCPeerConnection>` leaks it.
 //! - `close()` latches `is_closed` before its first await, so a cancelled close is unretryable.
 //! - `Disconnected` is transient; only `Failed`/`Closed` are terminal.
-//! - `RTCIceCandidatePair`'s `Display` layout — `is_relayed()` parses it because 0.13 keeps the
-//!   candidates private. 0.17+ exposes them; switch and delete the parse.
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -27,6 +25,7 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc::data_channel::RTCDataChannel;
+pub use webrtc::ice::agent::agent_config::InterfaceStunProvider;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
@@ -37,6 +36,11 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+pub use webrtc::util::Conn as InterfaceStunConn;
+pub use webrtc::util::Result as InterfaceStunResult;
+
+mod path_diagnostics;
+mod mapping_observers;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -59,6 +63,13 @@ enum WebRTCConnectionState {
     Closed(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IcePolicy {
+    All,
+    Relay,
+    DirectOnly,
+}
+
 /// A shared handle, not an owner: every clone points at the same `pc`, and `SESSIONS` holds one
 /// of those clones. Hence no `Drop` — closing per clone would kill a live session as soon as a
 /// losing race future is dropped, and closing on the last clone would wait on the very close
@@ -71,8 +82,10 @@ pub struct WebRTCStream {
     local_ice_rx: Arc<StdMutex<Option<mpsc::UnboundedReceiver<String>>>>,
     session_key: String,
     send_timeout: u64,
-    // Built with Relay-only ICE policy (force_relay): every selected pair goes through TURN.
+    // Both flags are immutable properties of the peer connection, shared by every clone.
     relay_only: bool,
+    direct_only: bool,
+    expanded_pool: u16,
     // Detached data channel, cached after the first `detach()` so send/recv do not re-lock and
     // re-fetch it per message. Shared across clones; `detach()` is idempotent.
     detached: Arc<Mutex<Option<Arc<DetachedDataChannel>>>>,
@@ -157,6 +170,10 @@ const FRAG_END: u8 = 0;
 /// unauthenticated peer can make a receiver hold. Kept at parity with TCP on purpose: one session
 /// moves between both paths, so a transport-specific ceiling would kill it on the other one.
 const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
+type InterfaceStunFactory = fn() -> Option<Arc<dyn InterfaceStunProvider>>;
+static INTERFACE_STUN_FACTORY: std::sync::OnceLock<InterfaceStunFactory> =
+    std::sync::OnceLock::new();
+
 // Four networks, not four names: webrtc-ice queries each URL from its own socket, so entries
 // sharing a host buy no redundancy - the two this list used to carry failed together, in the same
 // millisecond, on a peer whose route to that one host was down. Two anycast, two unicast; the 443
@@ -245,6 +262,8 @@ impl Clone for WebRTCStream {
             session_key: self.session_key.clone(),
             send_timeout: self.send_timeout,
             relay_only: self.relay_only,
+            direct_only: self.direct_only,
+            expanded_pool: self.expanded_pool,
             detached: self.detached.clone(),
             send_gate: self.send_gate.clone(),
             recv_state: self.recv_state.clone(),
@@ -293,6 +312,7 @@ impl WebRTCStream {
     // `'static` spelled out: an elided lifetime here is a warn-by-default future hard error on
     // the 1.75 toolchain CI pins (elided_lifetimes_in_associated_constant).
     const ICE_POLICY_KEY: &'static str = "ice_policy";
+    const ICE_POLICY_DIRECT_ONLY: &'static str = "direct_only";
     const ICE_POLICY_ALL: &'static str = "all";
 
     #[inline]
@@ -346,11 +366,21 @@ impl WebRTCStream {
         }));
     }
 
-    /// Whether a cached `SESSIONS` entry may be handed to a caller asking for `force_relay`: it
+    fn ice_policy(&self) -> IcePolicy {
+        if self.relay_only {
+            IcePolicy::Relay
+        } else if self.direct_only {
+            IcePolicy::DirectOnly
+        } else {
+            IcePolicy::All
+        }
+    }
+
+    /// Whether a cached `SESSIONS` entry may be handed to a caller asking for this ICE policy: it
     /// was built for the first caller, so its ICE policy may not match, and the state handler
     /// evicts late enough that dead entries linger. Both the lookup and the insert must use it.
-    fn is_reusable_for(&self, force_relay: bool) -> bool {
-        self.relay_only == force_relay
+    fn is_reusable_for(&self, policy: IcePolicy, full: u16) -> bool {
+        self.ice_policy() == policy && self.expanded_pool == full
             && !self.handoff.closing.load(Ordering::Acquire)
             // ICE has stopped hearing from the peer on this one. Not terminal, so nothing else
             // rejects it, but handing it to a caller that is about to judge liveness starts them
@@ -506,9 +536,29 @@ impl WebRTCStream {
 
     #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
-        Self::parse_ice_servers(&config::Config::get_option(
+        let mut servers = Self::parse_ice_servers(&config::Config::get_option(
             config::keys::OPTION_ICE_SERVERS,
-        ))
+        ));
+        let urls: Vec<_> = mapping_observers::current().into_iter().map(|ep| format!("stun:{ep}")).collect();
+        if !urls.is_empty() {
+            servers.insert(0, RTCIceServer { urls, ..Default::default() });
+        }
+        servers
+    }
+
+    fn ice_servers_for_policy(
+        mut servers: Vec<RTCIceServer>,
+        policy: IcePolicy,
+    ) -> Vec<RTCIceServer> {
+        if policy == IcePolicy::DirectOnly {
+            for server in &mut servers {
+                server
+                    .urls
+                    .retain(|url| url.starts_with("stun:") || url.starts_with("stuns:"));
+            }
+            servers.retain(|server| !server.urls.is_empty());
+        }
+        servers
     }
 
     /// The default UDP STUN servers as bare `host:port`, for application-level address probes.
@@ -517,6 +567,29 @@ impl WebRTCStream {
             .iter()
             .filter_map(|url| url.strip_prefix("stun:").map(str::to_owned))
             .collect()
+    }
+
+    /// Read the current adapter choice when a new peer connection is created.
+    pub fn set_interface_stun_provider_factory(
+        factory: fn() -> Option<Arc<dyn InterfaceStunProvider>>,
+    ) {
+        let _ = INTERFACE_STUN_FACTORY.set(factory);
+    }
+
+    pub fn remember_signed_observers(key: &str, observers: &[String]) {
+        mapping_observers::remember(key, observers);
+    }
+
+    pub fn signed_observer(endpoint: std::net::SocketAddrV4) -> bool {
+        mapping_observers::current().contains(&endpoint)
+    }
+
+    /// Supplemental physical-adapter UDP requests use only the known default host/port pairs.
+    pub fn is_default_stun_endpoint(host: &str, port: u16) -> bool {
+        let endpoint = format!("stun:{}:{}", host.trim_end_matches('.'), port);
+        DEFAULT_ICE_SERVERS
+            .iter()
+            .any(|url| url.eq_ignore_ascii_case(&endpoint))
     }
 
     /// Split out from `get_ice_servers` so parsing can be exercised without touching the
@@ -554,7 +627,7 @@ impl WebRTCStream {
         ice_servers
     }
 
-    /// How many binding requests the answerer's ICE agent sends on a pair without a response
+    /// How many binding requests a persistent ICE agent sends on a pair without a response
     /// before giving up on it: 74 at the 200ms check interval is ~14.8s, just inside the 15s
     /// persistence libwebrtc gives a pair (`CONNECTION_WRITE_TIMEOUT`), so both ends of a
     /// browser session keep checking for about the same time. The ICE crate's default of 7
@@ -574,11 +647,54 @@ impl WebRTCStream {
         force_relay: bool,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        Self::new_with_grouped_checks(remote_endpoint, force_relay, ms_timeout, false).await
+    }
+
+    pub async fn new_with_grouped_checks(
+        remote_endpoint: &str, force_relay: bool, ms_timeout: u64, grouped: bool,
+    ) -> ResultType<Self> {
+        Self::new_with_punch_profile(remote_endpoint, force_relay, ms_timeout, grouped, 0).await
+    }
+
+    /// Negotiate a direct ICE path on both endpoints, including later trickled candidates.
+    pub async fn new_direct_only(remote_endpoint: &str, ms_timeout: u64) -> ResultType<Self> {
+        Self::new_direct_with_punch_profile(remote_endpoint, ms_timeout, false, 0).await
+    }
+
+    pub async fn new_direct_with_punch_profile(
+        remote_endpoint: &str, ms_timeout: u64, grouped: bool, full: u16,
+    ) -> ResultType<Self> {
+        Self::new_with_policy(remote_endpoint, IcePolicy::DirectOnly, ms_timeout, grouped, full).await
+    }
+
+    pub fn has_expanded_udp_observer() -> bool {
+        !mapping_observers::current().is_empty()
+    }
+
+    /// Full gathering is explicitly negotiated over an authenticated relay session.
+    pub async fn new_with_punch_profile(
+        remote_endpoint: &str, force_relay: bool, ms_timeout: u64, grouped: bool, full: u16,
+    ) -> ResultType<Self> {
+        let policy = if force_relay {
+            IcePolicy::Relay
+        } else {
+            IcePolicy::All
+        };
+        Self::new_with_policy(remote_endpoint, policy, ms_timeout, grouped, full).await
+    }
+
+    async fn new_with_policy(
+        remote_endpoint: &str,
+        policy: IcePolicy,
+        ms_timeout: u64,
+        grouped: bool,
+        full: u16,
+    ) -> ResultType<Self> {
         let Some(rt) = WEBRTC_RT.as_ref() else {
             return Err(anyhow::anyhow!("WebRTC I/O runtime unavailable"));
         };
         let remote_endpoint = remote_endpoint.to_owned();
-        rt.spawn(Self::new_inner(remote_endpoint, force_relay, ms_timeout))
+        rt.spawn(Self::new_inner(remote_endpoint, policy, ms_timeout, grouped, full))
             .await
             .map_err(|err| anyhow::anyhow!("WebRTC setup task failed: {}", err))??
             .into_inner()
@@ -587,8 +703,10 @@ impl WebRTCStream {
 
     async fn new_inner(
         remote_endpoint: String,
-        force_relay: bool,
+        policy: IcePolicy,
         ms_timeout: u64,
+        grouped: bool,
+        full: u16,
     ) -> ResultType<NewStreamHandoff> {
         // The endpoint contains a Base64-encoded SDP with host addresses and live ICE
         // credentials. Log only its size so debug logs cannot disclose that information.
@@ -602,22 +720,53 @@ impl WebRTCStream {
             Self::get_remote_offer(&remote_endpoint)?
         };
 
+        let marked = !remote_offer.is_empty()
+            && Self::declares_policy(&remote_offer, Self::ICE_POLICY_DIRECT_ONLY);
+        let policy = match (policy, marked) {
+            (IcePolicy::Relay, true) => {
+                return Err(anyhow::anyhow!(
+                    "Conflicting relay-only and direct-only ICE policies"
+                ));
+            }
+            (_, true) => IcePolicy::DirectOnly,
+            (IcePolicy::DirectOnly, false) if !remote_endpoint.is_empty() => {
+                return Err(anyhow::anyhow!("Peer did not declare direct-only ICE"));
+            }
+            (policy, _) => policy,
+        };
+        if marked {
+            let offer: RTCSessionDescription = serde_json::from_str(&remote_offer)?;
+            if offer.sdp_type != RTCSdpType::Offer {
+                return Err(anyhow::anyhow!("Expected direct-only ICE offer"));
+            }
+            Self::validate_direct_sdp(&offer)?;
+        }
+        let force_relay = policy == IcePolicy::Relay;
         let mut key = Self::get_key_for_sdp_json(&remote_offer)?;
         let start_local_offer = remote_offer.is_empty();
+        let pool_observers = if full > 0 {
+            let observers = mapping_observers::current();
+            if force_relay || observers.is_empty() {
+                return Err(anyhow::anyhow!("Full ICE gathering requires a direct upgrade and a signed mapping observer"));
+            }
+            observers
+        } else {
+            Vec::new()
+        };
         if !key.is_empty() {
             // Claim inside the lock: `close_if_abandoned` commits under it too, so this hit
             // either registers in time to call that close off, or finds the entry already rejected.
             let cached = {
                 let sessions_lock = SESSIONS.lock().await;
                 match sessions_lock.get(&Self::cache_key(&key, start_local_offer)) {
-                    Some(session) if session.is_reusable_for(force_relay) => {
+                    Some(session) if session.is_reusable_for(policy, full) => {
                         Some(NewStreamHandoff::claim(session.clone()))
                     }
                     Some(session) => {
                         log::debug!(
-                            "Ignoring cached webrtc peer (relay_only {}, wanted {})",
-                            session.relay_only,
-                            force_relay
+                            "Ignoring cached webrtc peer (ICE policy {:?}, wanted {:?})",
+                            session.ice_policy(),
+                            policy
                         );
                         None
                     }
@@ -633,10 +782,24 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
-        // Answerer only: `remote_endpoint` is empty when this side is the offerer. The
-        // desktop controller keeps the crate default so it stays an unchanged comparison
-        // point while the persistence experiment runs on the controlled side.
-        if !remote_endpoint.is_empty() {
+        if !force_relay {
+            s.set_ice_pace_connectivity_checks(true);
+            s.set_ice_gather_interface_srflx(true);
+            s.set_grouped_physical_stun(grouped || policy == IcePolicy::DirectOnly);
+            if full > 0 {
+                s.set_expanded_udp_pool(pool_observers, full);
+            }
+            if let Some(provider) = INTERFACE_STUN_FACTORY.get().and_then(|factory| factory()) {
+                s.set_ice_interface_stun_provider(provider);
+            }
+            // A checked NAT mapping can be faster than a host candidate on a VPN.
+            // Give both a chance in the same ICE nomination window.
+            s.set_srflx_acceptance_min_wait(Some(Duration::ZERO));
+            s.set_prflx_acceptance_min_wait(Some(Duration::ZERO));
+        }
+        // Both sides must still be checking when a late candidate reaches a cellular
+        // controller. Give iOS offerers the same per-pair budget as the answerer.
+        if !remote_endpoint.is_empty() || cfg!(target_os = "ios") {
             s.set_ice_max_binding_requests(Some(Self::ICE_MAX_BINDING_REQUESTS));
         }
         // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
@@ -657,7 +820,7 @@ impl WebRTCStream {
 
         // Prepare the configuration, get ICE servers from config
         let config = RTCConfiguration {
-            ice_servers: Self::get_ice_servers(),
+            ice_servers: Self::ice_servers_for_policy(Self::get_ice_servers(), policy),
             ice_transport_policy: if force_relay {
                 RTCIceTransportPolicy::Relay
             } else {
@@ -841,7 +1004,7 @@ impl WebRTCStream {
         let offer_answer: ResultType<(String, String)> = async {
             if start_local_offer {
                 let sdp = pc.create_offer(None).await?;
-                let endpoint = Self::trickle_endpoint(&sdp, force_relay)?;
+                let endpoint = Self::trickle_endpoint(&sdp, policy)?;
                 pc.set_local_description(sdp.clone()).await?;
                 // SDP carries host/srflx IPs and ICE ufrag/pwd; log only its size, not the body.
                 log::debug!(
@@ -856,7 +1019,7 @@ impl WebRTCStream {
                 let sdp = serde_json::from_str::<RTCSessionDescription>(&remote_offer)?;
                 pc.set_remote_description(sdp.clone()).await?;
                 let answer = pc.create_answer(None).await?;
-                let endpoint = Self::trickle_endpoint(&answer, force_relay)?;
+                let endpoint = Self::trickle_endpoint(&answer, policy)?;
                 pc.set_local_description(answer).await?;
                 log::debug!(
                     "remote offer SDP received ({} bytes), local answer endpoint {} bytes",
@@ -897,6 +1060,8 @@ impl WebRTCStream {
             session_key: key.clone(),
             send_timeout: ms_timeout,
             relay_only: force_relay,
+            direct_only: policy == IcePolicy::DirectOnly,
+            expanded_pool: full,
             detached: Arc::new(Mutex::new(None)),
             send_gate: Arc::new(Semaphore::new(1)),
             recv_state: Arc::new(Mutex::new(RecvState::default())),
@@ -920,7 +1085,7 @@ impl WebRTCStream {
             // rejected there is still in the map when we get here, so returning it unconditionally
             // would discard the pc we just built precisely because the cached one was unusable.
             match final_lock.get(&cache_key) {
-                Some(session) if session.is_reusable_for(force_relay) => {
+                Some(session) if session.is_reusable_for(policy, full) => {
                     duplicate = Some(webrtc_stream.clone());
                     NewStreamHandoff::claim(session.clone())
                 }
@@ -941,9 +1106,8 @@ impl WebRTCStream {
 
     /// One-shot endpoint: waits for ICE gathering so the SDP already carries the candidates.
     /// The wait is deliberately unbounded — a deadline here would return a half-gathered SDP and
-    /// defeat the contract; callers needing one should wrap the call or use the trickle variant,
-    /// which both rustdesk signaling paths do. Remaining callers are the loopback tests and
-    /// `examples/webrtc.rs`, neither of which bounds it.
+    /// defeat the contract. Use `get_local_endpoint_within` for a best-effort snapshot or
+    /// `local_endpoint` when the signaling channel supports trickling candidates.
     #[inline]
     pub async fn get_local_endpoint(&self) -> ResultType<String> {
         // Preserve the original one-shot endpoint contract: callers that only exchange this SDP
@@ -951,10 +1115,23 @@ impl WebRTCStream {
         // gathered host/srflx/relay candidates.
         let mut gather_complete = self.pc.gathering_complete_promise().await;
         let _gathering_channel_closed = gather_complete.recv().await;
+        self.gathered_endpoint().await
+    }
+
+    /// For a peer that expects a single SDP over a reliable channel. Include candidates already
+    /// gathered if a STUN server is slow or unreachable. A later candidate cannot be signaled
+    /// to a peer that does not support trickle on this channel.
+    pub async fn get_local_endpoint_within(&self, budget: Duration) -> ResultType<String> {
+        let mut complete = self.pc.gathering_complete_promise().await;
+        let _ = timeout(budget, complete.recv()).await;
+        self.gathered_endpoint().await
+    }
+
+    async fn gathered_endpoint(&self) -> ResultType<String> {
         let Some(local_desc) = self.pc.local_description().await else {
             return Err(anyhow::anyhow!("Local desc is not set"));
         };
-        Self::encode_endpoint(local_desc.sdp_type, &local_desc.sdp, self.relay_only)
+        Self::encode_endpoint(local_desc.sdp_type, &local_desc.sdp, self.ice_policy())
     }
 
     /// The offer/answer exactly as it was created, for callers that signal candidates via
@@ -968,6 +1145,29 @@ impl WebRTCStream {
     #[inline]
     pub fn local_endpoint(&self) -> &str {
         self.local_endpoint.as_str()
+    }
+
+    /// Supplemental candidates for the trickle channel of an authenticated relay session.
+    pub async fn gather_gateway_candidate(&self) -> Option<String> {
+        if self.relay_only {
+            return None;
+        }
+        let candidate = self.pc.sctp().transport().ice_transport()
+            .gather_gateway_candidate()
+            .await?;
+        serde_json::to_string(&candidate.to_json().ok()?).ok()
+    }
+
+    pub async fn observed_udp_candidates(&self) -> Vec<String> {
+        if self.relay_only {
+            return Vec::new();
+        }
+        self.pc.sctp().transport().ice_transport()
+            .observed_udp_candidates()
+            .await
+            .iter()
+            .filter_map(|c| serde_json::to_string(&c.to_json().ok()?).ok())
+            .collect()
     }
 
     /// The size a trickle endpoint must stay under for the UDP leg of its route to be safe. It is
@@ -990,7 +1190,10 @@ impl WebRTCStream {
     /// Candidates are the only part of a local description that grows. Stripping them makes the
     /// size a property of the value rather than of when it was taken, so it cannot drift with
     /// gathering however this is later refactored.
-    fn trickle_endpoint(local_desc: &RTCSessionDescription, relay_only: bool) -> ResultType<String> {
+    fn trickle_endpoint(
+        local_desc: &RTCSessionDescription,
+        policy: IcePolicy,
+    ) -> ResultType<String> {
         let mut sdp = String::with_capacity(local_desc.sdp.len());
         for line in local_desc.sdp.lines() {
             // `end-of-candidates` would tell the remote agent to stop waiting for the trickle.
@@ -1000,24 +1203,28 @@ impl WebRTCStream {
             sdp.push_str(line);
             sdp.push_str("\r\n");
         }
-        Self::encode_endpoint(local_desc.sdp_type, &sdp, relay_only)
+        Self::encode_endpoint(local_desc.sdp_type, &sdp, policy)
     }
 
     /// Base64 envelope of a local description, carrying its ICE transport policy unless the pc is
     /// Relay-only (see `ICE_POLICY_KEY`).
     /// Built from the two fields a session description serializes rather than from the value, so
     /// a caller that rewrote the SDP cannot leave a stale `parsed` tree riding along with it.
-    fn encode_endpoint(sdp_type: RTCSdpType, sdp: &str, relay_only: bool) -> ResultType<String> {
+    fn encode_endpoint(sdp_type: RTCSdpType, sdp: &str, policy: IcePolicy) -> ResultType<String> {
         let mut envelope = serde_json::Map::new();
         envelope.insert("type".to_owned(), serde_json::to_value(sdp_type)?);
         envelope.insert("sdp".to_owned(), serde_json::Value::from(sdp));
-        if !relay_only {
+        if policy != IcePolicy::Relay {
             // Rides in the envelope, not a proto field the rendezvous server would forward,
             // because it is the offer's own property: the receiver must know whether
             // force_relay was policy (stay Relay-only) or transport. Older peers ignore it.
             envelope.insert(
                 Self::ICE_POLICY_KEY.to_owned(),
-                serde_json::Value::from(Self::ICE_POLICY_ALL),
+                serde_json::Value::from(if policy == IcePolicy::DirectOnly {
+                    Self::ICE_POLICY_DIRECT_ONLY
+                } else {
+                    Self::ICE_POLICY_ALL
+                }),
             );
         }
         Ok(Self::sdp_to_endpoint(&serde_json::to_string(&envelope)?))
@@ -1028,17 +1235,55 @@ impl WebRTCStream {
     /// pair may form even though the request carries force_relay. Absent key, foreign format
     /// or parse failure all mean "not declared" — the old Relay-only reading.
     pub fn endpoint_declares_all_ice(endpoint: &str) -> bool {
-        let Ok(sdp_json) = Self::get_remote_offer(endpoint) else {
-            return false;
+        Self::get_remote_offer(endpoint)
+            .is_ok_and(|sdp| Self::declares_policy(&sdp, Self::ICE_POLICY_ALL))
+    }
+
+    /// Whether the peer explicitly commits to gathering and accepting direct candidates only.
+    pub fn endpoint_declares_direct_only(endpoint: &str) -> bool {
+        Self::get_remote_offer(endpoint)
+            .is_ok_and(|sdp| Self::declares_policy(&sdp, Self::ICE_POLICY_DIRECT_ONLY))
+    }
+
+    fn declares_policy(sdp_json: &str, policy: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(sdp_json)
+            .is_ok_and(|v| v.get(Self::ICE_POLICY_KEY).and_then(|s| s.as_str()) == Some(policy))
+    }
+
+    fn validate_direct_candidate(raw: &str) -> ResultType<()> {
+        use webrtc::ice::candidate::{
+            candidate_base::unmarshal_candidate, Candidate, CandidateType,
         };
-        serde_json::from_str::<serde_json::Value>(&sdp_json)
-            .ok()
-            .and_then(|v| {
-                v.get(Self::ICE_POLICY_KEY)?
-                    .as_str()
-                    .map(|p| p == Self::ICE_POLICY_ALL)
-            })
-            .unwrap_or(false)
+        let raw = raw.strip_prefix("candidate:").unwrap_or(raw);
+        let candidate = unmarshal_candidate(raw)
+            .map_err(|_| anyhow::anyhow!("Invalid direct ICE candidate"))?;
+        match candidate.candidate_type() {
+            CandidateType::Host | CandidateType::ServerReflexive | CandidateType::PeerReflexive => {
+                Ok(())
+            }
+            _ => Err(anyhow::anyhow!("Non-direct ICE candidate")),
+        }
+    }
+
+    fn validate_direct_sdp(sdp: &RTCSessionDescription) -> ResultType<()> {
+        let parsed = sdp.unmarshal()?;
+        let attributes = parsed
+            .attributes
+            .iter()
+            .chain(parsed.media_descriptions.iter().flat_map(|m| &m.attributes));
+        for attr in attributes.filter(|a| a.is_ice_candidate()) {
+            Self::validate_direct_candidate(attr.value.as_deref().unwrap_or_default())?;
+        }
+        Ok(())
+    }
+
+    /// A scheduled first check must start with an empty remote ICE checklist.
+    pub fn endpoint_has_no_candidates(endpoint: &str) -> bool {
+        Self::get_remote_offer(endpoint).ok()
+            .and_then(|v| serde_json::from_str::<RTCSessionDescription>(&v).ok())
+            .is_some_and(|sdp| !sdp.sdp.lines().any(|line| {
+                line.trim_start().get(..12).is_some_and(|prefix| prefix.eq_ignore_ascii_case("a=candidate:"))
+            }))
     }
 
     #[inline]
@@ -1046,6 +1291,18 @@ impl WebRTCStream {
         let offer = Self::get_remote_offer(endpoint)?;
         log::debug!("WebRTC set remote sdp ({} bytes)", offer.len());
         let sdp = serde_json::from_str::<RTCSessionDescription>(&offer)?;
+        let marked = Self::declares_policy(&offer, Self::ICE_POLICY_DIRECT_ONLY);
+        if marked != self.direct_only {
+            return Err(anyhow::anyhow!(
+                "Peer did not negotiate the requested ICE policy"
+            ));
+        }
+        if marked {
+            if sdp.sdp_type != RTCSdpType::Answer {
+                return Err(anyhow::anyhow!("Expected direct-only ICE answer"));
+            }
+            Self::validate_direct_sdp(&sdp)?;
+        }
         self.pc.set_remote_description(sdp).await?;
         Ok(())
     }
@@ -1076,16 +1333,22 @@ impl WebRTCStream {
         let dtls = self.pc.sctp().transport();
         let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
 
-        // Not the stats report's `nominated` flag: webrtc-ice never clears it per checklist entry,
-        // so after a pair switch several entries carry it and map order decides the answer.
-        // 0.13 keeps the candidates private, so read the types out of `Display` by position.
-        let relay = RTCIceCandidateType::Relay.to_string();
-        Some(
-            pair.to_string()
-                .split(" <-> ")
-                .filter_map(|side| side.split_whitespace().nth(2))
-                .any(|typ| typ == relay),
-        )
+        let local = pair.local();
+        let remote = pair.remote();
+        log::debug!(
+            "Selected ICE pair: {} {} -> {} {}",
+            local.protocol, local.typ, remote.protocol, remote.typ
+        );
+        Self::pair_is_relayed(local.typ, remote.typ)
+    }
+
+    fn pair_is_relayed(local: RTCIceCandidateType, remote: RTCIceCandidateType) -> Option<bool> {
+        use RTCIceCandidateType::*;
+        match (local, remote) {
+            (Relay, _) | (_, Relay) => Some(true),
+            (Unspecified, _) | (_, Unspecified) => None,
+            _ => Some(false),
+        }
     }
 
     /// Whether the nominated pair reaches the peer over IPv6 — `None` before one is selected.
@@ -1094,12 +1357,7 @@ impl WebRTCStream {
     pub async fn is_remote_ipv6(&self) -> Option<bool> {
         let dtls = self.pc.sctp().transport();
         let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
-        // Same `Display` parse as `is_relayed`, one token over: a side renders as
-        // `(remote) <protocol> <typ> <address>:<port>`, and `protocol` is only udp/tcp, so the
-        // family has to come from the address — an IPv6 literal is the only one with two colons.
-        let pair = pair.to_string();
-        let remote = pair.split(" <-> ").nth(1)?;
-        Some(remote.split_whitespace().nth(3)?.matches(':').count() > 1)
+        Some(pair.remote().address.parse::<IpAddr>().ok()?.is_ipv6())
     }
 
     #[inline]
@@ -1113,6 +1371,9 @@ impl WebRTCStream {
             return Ok(());
         }
         let candidate = serde_json::from_str::<RTCIceCandidateInit>(candidate_json)?;
+        if self.direct_only && !candidate.candidate.is_empty() {
+            Self::validate_direct_candidate(&candidate.candidate)?;
+        }
         self.pc.add_ice_candidate(candidate).await?;
         Ok(())
     }
@@ -1541,7 +1802,9 @@ pub fn is_webrtc_endpoint(endpoint: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::webrtc::WebRTCStream;
-    use crate::webrtc::{NewStreamHandoff, DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS, WEBRTC_RT};
+    use crate::webrtc::{
+        IcePolicy, NewStreamHandoff, DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS, WEBRTC_RT,
+    };
     use bytes::{BufMut, Bytes, BytesMut};
     use std::{collections::HashMap, sync::Arc, time::Duration};
     use tokio::sync::Barrier;
@@ -1550,6 +1813,117 @@ mod tests {
 
     async fn new_test_stream() -> WebRTCStream {
         WebRTCStream::new("", false, 10000).await.unwrap()
+    }
+
+    #[test]
+    fn direct_only_ice_configuration_excludes_turn_urls() {
+        use webrtc::ice_transport::ice_server::RTCIceServer;
+        let servers = vec![
+            RTCIceServer {
+                urls: vec!["turn:relay.invalid:3478".into()],
+                ..Default::default()
+            },
+            RTCIceServer {
+                urls: vec![
+                    "turns:relay.invalid:5349".into(),
+                    "stun:mapper.invalid:3478".into(),
+                ],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            WebRTCStream::ice_servers_for_policy(servers.clone(), IcePolicy::All),
+            servers
+        );
+        let filtered = WebRTCStream::ice_servers_for_policy(servers, IcePolicy::DirectOnly);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].urls, ["stun:mapper.invalid:3478"]);
+    }
+
+    #[tokio::test]
+    async fn direct_only_requires_both_declarations_and_rejects_remote_relay() {
+        let mut offerer = WebRTCStream::new_direct_only("", 10000).await.unwrap();
+        let offer = offerer.local_endpoint();
+        assert!(WebRTCStream::endpoint_declares_direct_only(offer));
+        let sdp_json = WebRTCStream::get_remote_offer(offer).unwrap();
+        let offer_sdp: RTCSessionDescription = serde_json::from_str(&sdp_json).unwrap();
+        let unmarked =
+            WebRTCStream::encode_endpoint(offer_sdp.sdp_type, &offer_sdp.sdp, IcePolicy::All)
+                .unwrap();
+        assert!(WebRTCStream::new_direct_only(&unmarked, 1000)
+            .await
+            .is_err());
+        assert!(WebRTCStream::new(offer, true, 1000).await.is_err());
+        // Same fingerprint, different policy: this cached normal answer must not be reused.
+        let automatic = WebRTCStream::new(&unmarked, false, 10000).await.unwrap();
+        let gathered_offer = offerer
+            .get_local_endpoint_within(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut answerer = WebRTCStream::new(&gathered_offer, false, 10000)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&automatic.pc, &answerer.pc));
+        assert!(WebRTCStream::endpoint_declares_direct_only(
+            answerer.local_endpoint()
+        ));
+        assert!(offerer
+            .set_remote_endpoint(automatic.local_endpoint())
+            .await
+            .is_err());
+
+        let relay = "1 1 udp 16777215 192.0.2.12 50010 typ relay";
+        let mixed_offer = WebRTCStream::encode_endpoint(
+            offer_sdp.sdp_type,
+            &format!("{}a=candidate:{relay}\r\n", offer_sdp.sdp),
+            IcePolicy::DirectOnly,
+        )
+        .unwrap();
+        assert!(WebRTCStream::new(&mixed_offer, false, 1000).await.is_err());
+        let answer_sdp: RTCSessionDescription = serde_json::from_str(
+            &WebRTCStream::get_remote_offer(answerer.local_endpoint()).unwrap(),
+        )
+        .unwrap();
+        let mixed_answer = WebRTCStream::encode_endpoint(
+            answer_sdp.sdp_type,
+            &format!("{}a=candidate:{relay}\r\n", answer_sdp.sdp),
+            IcePolicy::DirectOnly,
+        )
+        .unwrap();
+        assert!(offerer.set_remote_endpoint(&mixed_answer).await.is_err());
+        let answer = answerer
+            .get_local_endpoint_within(Duration::from_secs(2))
+            .await
+            .unwrap();
+        offerer.set_remote_endpoint(&answer).await.unwrap();
+        offerer.wait_connected(10000).await.unwrap();
+        answerer.wait_connected(10000).await.unwrap();
+        assert_eq!(offerer.is_relayed().await, Some(false));
+        for raw in [
+            relay,
+            "malformed",
+            "1 1 udp 10 192.0.2.12 50010 typ unknown",
+        ] {
+            let candidate =
+                serde_json::json!({"candidate": format!("candidate:{raw}")}).to_string();
+            assert!(offerer.add_remote_ice_candidate(&candidate).await.is_err());
+        }
+        offerer.send_raw(b"direct".to_vec()).await.unwrap();
+        let received = answerer.next_timeout(5000).await.unwrap().unwrap();
+        assert_eq!(&received[..], b"direct");
+        answerer.close().await;
+        automatic.close().await;
+        offerer.close().await;
+    }
+
+    #[test]
+    fn test_selected_pair_classification() {
+        use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::*;
+        assert_eq!(WebRTCStream::pair_is_relayed(Host, Srflx), Some(false));
+        assert_eq!(WebRTCStream::pair_is_relayed(Prflx, Host), Some(false));
+        assert_eq!(WebRTCStream::pair_is_relayed(Relay, Host), Some(true));
+        assert_eq!(WebRTCStream::pair_is_relayed(Host, Relay), Some(true));
+        assert_eq!(WebRTCStream::pair_is_relayed(Unspecified, Host), None);
     }
 
     #[test]
@@ -1749,6 +2123,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_bounded_endpoint_includes_candidates_ready_at_deadline() {
+        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let live = first_gathered_description(&offerer).await;
+        let snapshot = offerer.get_local_endpoint_within(Duration::ZERO).await;
+        offerer.close().await;
+        let live = live.expect("no ICE candidate gathered within 10s");
+        let json = WebRTCStream::get_remote_offer(&snapshot.unwrap()).unwrap();
+        let snapshot: RTCSessionDescription = serde_json::from_str(&json).unwrap();
+        for line in live
+            .sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+        {
+            assert!(snapshot.sdp.lines().any(|candidate| candidate == line));
+        }
+    }
+
     /// The split itself: candidates out, everything ICE and DTLS need to start in. A stripped
     /// endpoint the peer cannot consume would trade a silent drop for a silent failure.
     #[tokio::test]
@@ -1758,7 +2150,7 @@ mod tests {
         offerer.close().await;
         let gathered = gathered.expect("no ICE candidate gathered within 10s");
 
-        let endpoint = WebRTCStream::trickle_endpoint(&gathered, false).unwrap();
+        let endpoint = WebRTCStream::trickle_endpoint(&gathered, IcePolicy::All).unwrap();
         let json = WebRTCStream::get_remote_offer(&endpoint).unwrap();
         assert!(!json.contains("a=candidate:"), "candidate survived the split");
         assert!(
@@ -1792,7 +2184,8 @@ mod tests {
         // `encode_endpoint`, which `get_local_endpoint` also goes through, holds the opposite
         // contract: carry whatever it is handed, candidates included. (What `get_local_endpoint`
         // adds on top — the gathering wait — is covered by test_webrtc_loopback_gathered_endpoints.)
-        let kept = WebRTCStream::encode_endpoint(gathered.sdp_type, &gathered.sdp, false).unwrap();
+        let kept = WebRTCStream::encode_endpoint(gathered.sdp_type, &gathered.sdp, IcePolicy::All)
+            .unwrap();
         assert!(
             WebRTCStream::get_remote_offer(&kept)
                 .unwrap()
@@ -2050,6 +2443,45 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let mut answerer = answerer;
         answerer.wait_connected(20000).await.unwrap();
         (offerer, answerer)
+    }
+
+    #[tokio::test]
+    async fn mapping_probe_does_not_take_over_an_established_udp_session() {
+        let (mut offerer, mut answerer) = connect_loopback().await;
+        let controller = offerer.clone();
+        let controlled = answerer.clone();
+        assert!(controller
+            .ice_path_diagnostics()
+            .await
+            .lines()
+            .any(|line| line == "udpMapping=unavailable"));
+        let (local, remote, ()) = timeout(Duration::from_secs(6), async {
+            tokio::join!(
+                controller.wait_for_punch_ready(),
+                controlled.wait_for_punch_ready(),
+                async {
+                    // The peers already have a selected pair. A coordinated wake
+                    // should be ignored, and the STUN measurement must leave the
+                    // DTLS/SCTP payload on the existing ICE socket untouched.
+                    let nudged = tokio::join!(
+                        controller.request_punch_check(),
+                        controlled.request_punch_check()
+                    );
+                    assert_eq!(nudged, (false, false));
+                    offerer.send_raw(b"checking".to_vec()).await.unwrap();
+                    assert_eq!(&answerer.next().await.unwrap().unwrap()[..], b"checking");
+                }
+            )
+        })
+        .await
+        .expect("mapping check blocked a connected WebRTC session");
+        for counts in [local, remote] {
+            assert!(counts[5] <= counts[4]);
+        }
+        offerer.close().await;
+        answerer.close().await;
+        assert_eq!(controller.wait_for_punch_ready().await, [0; 6]);
+        assert!(!controller.request_punch_check().await);
     }
 
     // next()'s teardown must not be cancellable: an awaited close that loses the select! race
@@ -2466,6 +2898,38 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
             // Host-candidate loopback is direct, never TURN-relayed.
             assert_eq!(offerer.is_relayed().await, Some(false));
+            for stream in [&offerer, &answerer] {
+                let snapshot = stream.ice_path_diagnostics().await;
+                assert!(
+                    snapshot.contains("dtls=connected sctp=connected"),
+                    "{}",
+                    snapshot
+                );
+                assert!(snapshot.contains("selected=udp/"), "{}", snapshot);
+                let socket = stream
+                    .pc
+                    .sctp()
+                    .transport()
+                    .ice_transport()
+                    .udp_socket_diagnostics()
+                    .await
+                    .expect("missing UDP socket counters");
+                assert!(
+                    snapshot.contains("udpCandidate [readers,reads,"),
+                    "{}",
+                    snapshot
+                );
+                assert!(socket.candidate_readers > 0 && socket.udp_reads > 0);
+                assert!(socket.req_accepted > 0 || socket.resp_accepted > 0);
+                assert!(socket.binding_request_headers > 0 || socket.binding_success > 0);
+                let exchanged = snapshot.lines().filter(|line| line.starts_with("remote="))
+                    .filter_map(|line| line.split_once(" traffic="))
+                    .filter_map(|(_, counts)| serde_json::from_str::<[u64; 6]>(counts).ok())
+                    .any(|[sent, _, received, replied, _, matched]| {
+                        (sent > 0 && matched > 0) || (received > 0 && replied > 0)
+                    });
+                assert!(exchanged, "{}", snapshot);
+            }
 
             // Small message.
             offerer.send_raw(b"hello".to_vec()).await.unwrap();
@@ -2539,7 +3003,13 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
-            .spawn(WebRTCStream::new_inner(String::new(), false, 20000))
+            .spawn(WebRTCStream::new_inner(
+                String::new(),
+                IcePolicy::All,
+                20000,
+                false,
+                0,
+            ))
             .await
             .expect("setup task")
             .expect("offerer builds");
@@ -2579,7 +3049,13 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
-            .spawn(WebRTCStream::new_inner(String::new(), false, 20000))
+            .spawn(WebRTCStream::new_inner(
+                String::new(),
+                IcePolicy::All,
+                20000,
+                false,
+                0,
+            ))
             .await
             .expect("setup task")
             .expect("offerer builds");
